@@ -1,0 +1,4 @@
+interface:
+  display_name: "Headless Workflow"
+  short_description: "Run a swarm of headless-agent workers from one script"
+  default_prompt: "Use $headless-workflow to fan a bounded task out across many headless-agent workers (digest, judge, verify, fork from shared context), wait once, and resume if interrupted."
