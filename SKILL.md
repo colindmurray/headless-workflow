@@ -66,7 +66,9 @@ The run prints `RUN_ID`, `RUN_DIR`, and `LOG` first, then blocks until
 same providers through the minimal `pi` harness). Each carries harness/provider/model,
 effort, posture, `max_concurrency`, a quota id for the `check-ai-quota`
 preflight (exit 20/22 skips the route), and a `fallback` list tried in order
-when a dispatch fails. Override or add routes in
+when a dispatch fails. Add `"format": "json"` to any route when you need to
+account for its token spend afterwards: without it a codex route runs in its
+text default, whose stream carries no structured usage. Override or add routes in
 `~/.config/headless-workflow/routes.json` or `--routes file.json` (per-name
 merge), or pass a dict: `route={"harness": "kimi_code", "provider": "kimi",
 "model": "k3"}`. `gemini` defaults to posture `code` because `agy` in review
