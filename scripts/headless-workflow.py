@@ -54,9 +54,18 @@ DEFAULT_ROUTES = {
     "luna":     {"harness": "codex",       "provider": "openai",    "model": "gpt-5.6-luna",               "effort": "high", "posture": "review", "max_concurrency": 3, "quota": "openai",   "fallback": [],                 "timeout": 1800},
     "terra":    {"harness": "codex",       "provider": "openai",    "model": "gpt-5.6-terra",              "effort": "high", "posture": "review", "max_concurrency": 2, "quota": "openai",   "fallback": [],                 "timeout": 2400},
     "sol":      {"harness": "codex",       "provider": "openai",    "model": "gpt-5.6-sol",                "effort": "high", "posture": "review", "max_concurrency": 2, "quota": "openai",   "fallback": [],                 "timeout": 2400},
+    # pi routes: the same providers through a minimal harness. Pi has no MCP,
+    # no subagents and no permission prompts, so its system prompt is ~1.3k
+    # tokens against Claude Code's or Codex's much larger one, and it reaches
+    # its first event in ~0.3s. Prefer these for wide fan-outs of small bounded
+    # steps where the per-worker prompt tax dominates. `context: lean` keeps
+    # skills and context files out of that prompt.
+    "pi-glm":   {"harness": "pi", "provider": "zai",          "model": "glm-5.3-flash",              "effort": "high", "posture": "review", "context": "lean", "max_concurrency": 6, "quota": "zai",    "fallback": ["glm", "pi-muse"],  "timeout": 1800},
+    "pi-muse":  {"harness": "pi", "provider": "meta",         "model": "muse-spark-1.3-contributor", "effort": "high", "posture": "review", "context": "lean", "max_concurrency": 6, "quota": "meta",   "fallback": ["muse", "pi-glm"],  "timeout": 1800},
+    "pi-sol":   {"harness": "pi", "provider": "openai-codex", "model": "gpt-5.6-sol",                "effort": "high", "posture": "review", "context": "lean", "max_concurrency": 2, "quota": "openai", "fallback": ["sol"],             "timeout": 2400},
 }
 
-FORK_HARNESSES = {"claude_code", "codex", "opencode", "prime-agent"}
+FORK_HARNESSES = {"claude_code", "codex", "opencode", "pi", "prime-agent"}
 RETRYABLE_PATTERNS = ("429", "rate limit", "Rate limit", "overloaded", "503", "502", "timed out", "timeout", "401", "token expired", "quota", "exhausted", "no output produced", "no response content")
 
 
@@ -513,6 +522,8 @@ class Workflow:
             cmd += ["--effort", spec["effort"]]
         if spec.get("harness") == "agy" and spec.get("timeout"):
             cmd += ["--timeout", f"{int(spec['timeout'])}s"]
+        if spec.get("harness") == "pi" and spec.get("context"):
+            cmd += ["--context", spec["context"]]
         for d in (spec.get("_add_dirs") or []):
             cmd += ["--add-dir", d]
         if fork_id:

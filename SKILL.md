@@ -62,7 +62,8 @@ The run prints `RUN_ID`, `RUN_DIR`, and `LOG` first, then blocks until
 
 `python3 "$HW" routes` prints the effective table. Built-ins: `glm`,
 `gemini`, `muse`, `kimi`, `deepseek` (cheap workers), `sonnet`, `opus`,
-`luna`, `terra`, `sol` (judgment). Each carries harness/provider/model,
+`luna`, `terra`, `sol` (judgment), and `pi-glm`, `pi-muse`, `pi-sol` (the
+same providers through the minimal `pi` harness). Each carries harness/provider/model,
 effort, posture, `max_concurrency`, a quota id for the `check-ai-quota`
 preflight (exit 20/22 skips the route), and a `fallback` list tried in order
 when a dispatch fails. Override or add routes in
@@ -74,7 +75,7 @@ posture is denied file reads.
 ## Fork and structured output
 
 `wf.fork(parent, prompt)` continues the parent's session on fork-capable
-harnesses (`claude_code`, `codex`, `opencode`, `prime-agent`): children share
+harnesses (`claude_code`, `codex`, `opencode`, `pi`, `prime-agent`): children share
 the parent's history and cached prefix. On other harnesses it becomes a fresh
 agent that receives the parent's prompt and answer as context, and
 `result.forked` is `False`. `schema=` forces JSON: fences and prose are
