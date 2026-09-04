@@ -60,6 +60,10 @@ DEFAULT_ROUTES = {
     # its first event in ~0.3s. Prefer these for wide fan-outs of small bounded
     # steps where the per-worker prompt tax dominates. `context: lean` keeps
     # skills and context files out of that prompt.
+    # `format: "json"` is available on any route and makes the provider emit a
+    # structured event stream, which is the only way to account for a run's real
+    # token spend afterwards. It is not the default because changing a live
+    # campaign's stream format mid-flight is not worth the churn.
     "pi-glm":   {"harness": "pi", "provider": "zai",          "model": "glm-5.3-flash",              "effort": "high", "posture": "review", "context": "lean", "max_concurrency": 6, "quota": "zai",    "fallback": ["glm", "pi-muse"],  "timeout": 1800},
     "pi-muse":  {"harness": "pi", "provider": "meta",         "model": "muse-spark-1.3-contributor", "effort": "high", "posture": "review", "context": "lean", "max_concurrency": 6, "quota": "meta",   "fallback": ["muse", "pi-glm"],  "timeout": 1800},
     "pi-sol":   {"harness": "pi", "provider": "openai-codex", "model": "gpt-5.6-sol",                "effort": "high", "posture": "review", "context": "lean", "max_concurrency": 2, "quota": "openai", "fallback": ["sol"],             "timeout": 2400},
@@ -524,6 +528,8 @@ class Workflow:
             cmd += ["--timeout", f"{int(spec['timeout'])}s"]
         if spec.get("harness") == "pi" and spec.get("context"):
             cmd += ["--context", spec["context"]]
+        if spec.get("format"):
+            cmd += ["--format", spec["format"]]
         for d in (spec.get("_add_dirs") or []):
             cmd += ["--add-dir", d]
         if fork_id:
