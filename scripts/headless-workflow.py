@@ -288,8 +288,11 @@ class Workflow:
         self.quiet = quiet
         self.args = args
         self.journal = Journal(run_dir)
-        self.global_sem = asyncio.Semaphore(global_concurrency)
-        self.route_sems = {name: asyncio.Semaphore(int(spec.get("max_concurrency", 4))) for name, spec in routes.items()}
+        # Semaphores are created lazily inside the running loop: on Python 3.9
+        # a Semaphore built before asyncio.run() binds to a different loop.
+        self.global_concurrency = global_concurrency
+        self._global_sem = None
+        self.route_sems = {}
         self.dispatched = 0
         self.phase_title = None
         self.quota_cache = {}
@@ -422,6 +425,12 @@ class Workflow:
         spec["_files"] = overrides.get("files")
         spec["_add_dirs"] = overrides.get("add_dirs")
         return spec
+
+    @property
+    def global_sem(self):
+        if self._global_sem is None:
+            self._global_sem = asyncio.Semaphore(self.global_concurrency)
+        return self._global_sem
 
     def _sem_for(self, spec, rlabel):
         if rlabel not in self.route_sems:

@@ -13,6 +13,8 @@ costs the caller one long wait instead of a turn per worker.
 - `references/patterns.md` — digest→judge→verify→synthesize, shared-context
   fork fan-out, loop-until-dry, issue swarm, cheap Codex wait
 - `examples/` — runnable scripts
+  - `campaign-audit.py` — digest, judge per lane, consequence check,
+    evidence check, synthesize
 - `tests/` — unit tests driven by `tests/fake-headless-agent.sh`, a stand-in
   that mirrors the real dispatcher's stdout and run-dir contract
 
