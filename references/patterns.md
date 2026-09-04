@@ -123,3 +123,12 @@ exec_command:  python3 "$HW" run wf.py --args @args.json > /tmp/hw.log 2>&1   (y
 write_stdin:   session_id=<cell>, chars="", yield_time_ms=<minutes × 60000>   (one call; repeat once if still running)
 then:          python3 "$HW" status <RUN_ID>; python3 "$HW" result <RUN_ID>
 ```
+
+## Campaign audit
+
+`examples/campaign-audit.py` audits a corpus of issues, docs, skills, and goal
+files in five stages: digest (cheap, batched), judge (one strong agent per
+lane), consequence check (strong, tries to refute each P0 against the live
+campaign), evidence check (cheap, re-reads every surviving citation), and
+synthesize (strong, writes the report). The strong route pays only for judge,
+consequence check, and synthesis; the report is a candidate for the operator.
