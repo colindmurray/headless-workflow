@@ -290,33 +290,132 @@ class AgentResult:
         return cls(**d)
 
 
+def valid_cache_key(key):
+    return isinstance(key, str) and len(key) > 0
+
+
 class Journal:
     def __init__(self, run_dir):
         self.run_dir = run_dir
         self.path = os.path.join(run_dir, "journal.jsonl")
         self.cache = {}
         self.steps = {}
+        self._cell_state = {}
+        self._cell_failures = {}
+        self._cache_sequence = {}
+        self._sequence = 0
         if os.path.exists(self.path):
             with open(self.path) as fh:
-                for line in fh:
+                for sequence, line in enumerate(fh, 1):
+                    self._sequence = sequence
                     try:
                         e = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if not isinstance(e, dict):
-                        continue
-                    if e.get("type") == "completed" and e.get("key"):
-                        self.cache[e["key"]] = e["result"]
-                    if e.get("key"):
-                        self.steps[e["key"]] = e
+                    self._ingest(e, allow_cache=True, sequence=sequence)
 
     def write(self, event):
         event = dict(event)
         event["at"] = now_iso()
         with open(self.path, "a") as fh:
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
-        if event.get("key"):
-            self.steps[event["key"]] = event
+        self._sequence += 1
+        self._ingest(event, allow_cache=False, sequence=self._sequence)
+
+    def _ingest(self, event, allow_cache, sequence):
+        """Validate before any cache/steps/state mutation.
+
+        Shared by file replay and live writes so both observe identical
+        state. A `completed` record needs a non-empty string key and a
+        mapping-shaped result before it may touch the cache or the step
+        table; anything else -- missing result, invalid or unhashable key,
+        non-mapping result, malformed duplicates -- is ignored, so it can
+        never crash recovery or overwrite an established good entry. Other
+        records need a non-empty string key for the step table.
+        `allow_cache` stays replay-only: live writes never populate the
+        cache, preserving the rule that only a fresh `--resume` replay
+        serves cached steps.
+        """
+        if not isinstance(event, dict):
+            return
+        key = event.get("key")
+        if event.get("type") == "completed":
+            result = event.get("result")
+            if not (valid_cache_key(key) and isinstance(result, dict)):
+                return
+            if allow_cache:
+                self.cache[key] = result
+                self._cache_sequence[key] = sequence
+            self.steps[key] = event
+            return
+        if valid_cache_key(key):
+            self.steps[key] = event
+        self._note_cell_state(event, sequence)
+
+    def _note_cell_state(self, event, sequence):
+        """Track the latest structured cell lifecycle per explicit cell id.
+
+        A `cell-state` record carries `cell`, `state` ("failed"/"passed"),
+        and a monotonic `generation`; the highest generation always wins and
+        equal generations keep the first record, so delayed or duplicated
+        lower-generation events can never regress observed state. Failure
+        generations retain their journal sequence, allowing cache eligibility
+        to compare a completion with the failure that followed it even after
+        a later clear. Anything else -- non-string or empty ids, unknown
+        states, non-integer generations, or malformed metadata -- is ignored
+        safely and can never crash on unhashable values. Updated on every live
+        write as well as on replay, so a failure recorded mid-run is visible
+        to later serve checks in the same Journal instance.
+        """
+        if event.get("type") != "cell-state":
+            return
+        cell = event.get("cell")
+        state = event.get("state")
+        generation = event.get("generation", 0)
+        if not (isinstance(cell, str) and cell):
+            return
+        if state not in ("failed", "passed"):
+            return
+        if not isinstance(generation, int) or isinstance(generation, bool):
+            return
+        if "label" in event and not isinstance(event["label"], str):
+            return
+        if "reason" in event and not isinstance(event["reason"], str):
+            return
+        if ("evidence_state" in event
+                and event["evidence_state"] not in ("ok", "absent", "unreadable")):
+            return
+        current = self._cell_state.get(cell)
+        if current is None or generation > current[1]:
+            self._cell_state[cell] = (state, generation)
+        if state == "failed":
+            failure = self._cell_failures.get(cell)
+            if failure is None or generation > failure[0]:
+                self._cell_failures[cell] = (generation, sequence)
+
+    def cache_stale(self, cached, key=None):
+        """True when a cached completion predates a later cell failure.
+
+        A cached result for a cell is stale when its journal completion
+        sequence is not after the latest accepted failure sequence. This
+        remains true after a later clear: an older completion cannot satisfy
+        restored evidence, while a fresh completion earned after the failure
+        is immediately eligible. Results without a cell id, and generic
+        callers without sequence metadata, retain the legacy behavior.
+        """
+        if not isinstance(cached, dict):
+            return True
+        cell = cached.get("cell")
+        if not (isinstance(cell, str) and cell):
+            return False
+        failure = self._cell_failures.get(cell)
+        if failure is None:
+            return False
+        completion = self._cache_sequence.get(key) if valid_cache_key(key) else None
+        if completion is not None:
+            return completion <= failure[1]
+        current = self._cell_state.get(cell)
+        return current is not None and current[0] == "failed"
 
 
 # --------------------------------------------------------------------------
@@ -432,7 +531,8 @@ class Workflow:
         evidence content behind the prompt; every supplied field takes part in
         the step identity, so repaired evidence retires the old cache entry.
         Run one such agent per cell under `parallel()` and a resume
-        redispatches only the failed or unrun cells.
+        redispatches only the failed or unrun cells. A cached completion
+        older than the cell's latest structured failure is never served.
         """
         overrides = {k: v for k, v in {"dir": dir, "posture": posture, "effort": effort, "model": model, "timeout": timeout, "files": files, "add_dirs": add_dirs, "openai_account": openai_account}.items() if v is not None}
         route_name = route if isinstance(route, str) else "custom:" + hashlib.sha1(json.dumps(route, sort_keys=True).encode()).hexdigest()[:8]
@@ -451,13 +551,16 @@ class Workflow:
         cell_fields = {"cell": cell, "neighbors": neighbors_norm, "evidence_digest": evidence_digest, "input_identity": input_identity}
         cached = self.journal.cache.get(key)
         if cached:
-            r = AgentResult.from_dict(cached)
-            if success is not None and not self._semantic_ok(success, r, label):
-                self.log(f"{label}: cached result fails the semantic success predicate; redispatching")
+            if self.journal.cache_stale(cached, key):
+                self.log(f"{label}: cached result predates a later cell failure; redispatching")
             else:
-                self.log(f"cached: {label}")
-                r.cached = True
-                return r
+                r = AgentResult.from_dict(cached)
+                if success is not None and not self._semantic_ok(success, r, label):
+                    self.log(f"{label}: cached result fails the semantic success predicate; redispatching")
+                else:
+                    self.log(f"cached: {label}")
+                    r.cached = True
+                    return r
         if fallback is None:
             fallback = list(self._resolve_route(route, overrides).get("fallback", [])) if isinstance(route, str) else []
         attempt_routes = [route] + [r for r in fallback if r != route]
