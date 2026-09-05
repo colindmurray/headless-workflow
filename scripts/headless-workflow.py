@@ -212,11 +212,31 @@ def validate_schema(value, schema, path="$"):
     return None
 
 
-def step_key(kind, prompt, route_name, overrides, schema, parent):
-    """Stable identity of one agent step; the journal caches results by it."""
-    payload = json.dumps({"kind": kind, "prompt": prompt, "route": route_name, "overrides": overrides or {},
-                          "schema": schema, "parent": parent}, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+def step_key(kind, prompt, route_name, overrides, schema, parent, cell=None, neighbors=None,
+             evidence_digest=None, input_identity=None):
+    """Stable identity of one agent step; the journal caches results by it.
+
+    The trailing cell-granular fields take part in the identity only when
+    given, so keys computed without them are unchanged: `cell` names one
+    review cell, `neighbors` declares the neighbor cells it was judged with,
+    and `evidence_digest`/`input_identity` carry a deterministic digest of
+    the (possibly repaired) evidence content behind the prompt. Changing any
+    supplied field retires the old cache entry and forces a fresh dispatch.
+    """
+    payload = {"kind": kind, "prompt": prompt, "route": route_name, "overrides": overrides or {},
+               "schema": schema, "parent": parent}
+    if cell is not None:
+        payload["cell"] = cell
+    if neighbors is not None:
+        try:
+            payload["neighbors"] = sorted(neighbors, key=repr) if isinstance(neighbors, (list, tuple, set)) else neighbors
+        except TypeError:
+            payload["neighbors"] = list(neighbors)
+    if evidence_digest is not None:
+        payload["evidence_digest"] = evidence_digest
+    if input_identity is not None:
+        payload["input_identity"] = input_identity
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:24]
 
 
 # --------------------------------------------------------------------------
@@ -243,6 +263,10 @@ class AgentResult:
         self.openai_account = kw.get("openai_account")
         self.model = kw.get("model")
         self.effort = kw.get("effort")
+        self.cell = kw.get("cell")
+        self.neighbors = kw.get("neighbors")
+        self.evidence_digest = kw.get("evidence_digest")
+        self.input_identity = kw.get("input_identity")
 
     def __bool__(self):
         return bool(self.ok)
@@ -258,11 +282,21 @@ class AgentResult:
         return default
 
     def to_dict(self):
-        return {k: getattr(self, k) for k in ("ok", "text", "data", "session_id", "run_dir", "route", "label", "key", "forked", "attempts", "error", "prompt", "cached", "openai_account", "model", "effort")}
+        return {k: getattr(self, k) for k in ("ok", "text", "data", "session_id", "run_dir", "route", "label", "key", "forked", "attempts", "error", "prompt", "cached", "openai_account", "model", "effort",
+                                              "cell", "neighbors", "evidence_digest", "input_identity")}
 
     @classmethod
     def from_dict(cls, d):
         return cls(**d)
+
+
+def valid_cache_key(key):
+    return isinstance(key, str) and len(key) > 0
+
+
+GENERIC_EVENT_TYPES = frozenset((
+    "phase", "run-started", "run-finished", "started", "completed", "failed",
+))
 
 
 class Journal:
@@ -271,6 +305,10 @@ class Journal:
         self.path = os.path.join(run_dir, "journal.jsonl")
         self.cache = {}
         self.steps = {}
+        self._cell_state = {}
+        self._cell_failures = {}
+        self._cache_sequence = {}
+        self._sequence = 0
         if os.path.exists(self.path):
             with open(self.path) as fh:
                 for line in fh:
@@ -278,18 +316,141 @@ class Journal:
                         e = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if e.get("type") == "completed" and e.get("key"):
-                        self.cache[e["key"]] = e["result"]
-                    if e.get("key"):
-                        self.steps[e["key"]] = e
+                    if self._ingest(e, allow_cache=True,
+                                    sequence=self._sequence + 1):
+                        self._sequence += 1
 
     def write(self, event):
         event = dict(event)
         event["at"] = now_iso()
         with open(self.path, "a") as fh:
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
-        if event.get("key"):
-            self.steps[event["key"]] = event
+        if self._ingest(event, allow_cache=False, sequence=self._sequence + 1):
+            self._sequence += 1
+
+    def _ingest(self, event, allow_cache, sequence):
+        """Classify, validate, then project -- atomically.
+
+        The event kind is classified first: anything claiming the
+        structured cell lifecycle -- exact type `cell-state`, or a top-level
+        `cell`/`generation` marker -- is fully validated as a non-step
+        event and can never fall through into the generic step table, even
+        with a valid key. A `completed` record needs a non-empty string key
+        and a mapping-shaped result before it may touch the cache or the
+        step table. Other string-typed records need a non-empty string key
+        for the step table. Anything else -- missing, null, or numeric
+        types, missing result, invalid or unhashable keys, non-mapping
+        results, malformed duplicates -- is ignored, so it can never crash
+        recovery, smuggle `key=poison` into the steps, or overwrite an
+        established good entry. Returns True exactly when a projection was
+        applied, so callers advance the logical `_sequence` only for
+        accepted events. Shared by file replay and live writes so both
+        observe identical state. `allow_cache` stays replay-only: live
+        writes never populate the cache, preserving the rule that only a
+        fresh `--resume` replay serves cached steps.
+        """
+        if not isinstance(event, dict):
+            return False
+        kind = event.get("type")
+        if kind == "cell-state" or "cell" in event or "generation" in event:
+            return self._note_cell_state(event, sequence)
+        if not isinstance(kind, str) or kind not in GENERIC_EVENT_TYPES:
+            return False
+        key = event.get("key")
+        if kind in ("phase", "run-started", "run-finished"):
+            if "key" not in event:
+                return True
+            if valid_cache_key(key):
+                self.steps[key] = event
+                return True
+            return False
+        if kind == "completed":
+            result = event.get("result")
+            if not (valid_cache_key(key) and isinstance(result, dict)):
+                return False
+            if allow_cache:
+                self.cache[key] = result
+                self._cache_sequence[key] = sequence
+            self.steps[key] = event
+            return True
+        if valid_cache_key(key):
+            self.steps[key] = event
+            return True
+        return False
+
+    def _note_cell_state(self, event, sequence):
+        """Track the latest structured cell lifecycle per explicit cell id.
+
+        A `cell-state` record carries `cell`, `state` ("failed"/"passed"),
+        and an explicitly present monotonic `generation` -- an int that is
+        not a bool and is >= 0, with explicit zero accepted. Acceptance is
+        one ordering decision shared by every projection: only a generation
+        strictly newer than the established one updates `_cell_state`, and
+        only that same accepted record may update `_cell_failures` -- equal,
+        lower, delayed, duplicate, or malformed events update neither
+        projection, failure ordering, cache eligibility, nor the logical
+        sequence. Failure generations retain their journal sequence,
+        allowing cache eligibility to compare a completion with the failure
+        that followed it even after a later clear. Anything else -- missing
+        or malformed generations, non-string or empty ids, unknown states,
+        or malformed metadata -- is ignored safely and can never crash on
+        unhashable values. Returns True exactly when the record was
+        accepted. Updated on every live write as well as on replay, so a
+        failure recorded mid-run is visible to later serve checks in the
+        same Journal instance.
+        """
+        if event.get("type") != "cell-state":
+            return False
+        cell = event.get("cell")
+        state = event.get("state")
+        if "generation" not in event:
+            return False
+        generation = event.get("generation")
+        if not (isinstance(cell, str) and cell):
+            return False
+        if state not in ("failed", "passed"):
+            return False
+        if (not isinstance(generation, int) or isinstance(generation, bool)
+                or generation < 0):
+            return False
+        if "label" in event and not isinstance(event["label"], str):
+            return False
+        if "reason" in event and not isinstance(event["reason"], str):
+            return False
+        if ("evidence_state" in event
+                and event["evidence_state"] not in ("ok", "absent", "unreadable")):
+            return False
+        current = self._cell_state.get(cell)
+        if current is not None and generation <= current[1]:
+            return False
+        self._cell_state[cell] = (state, generation)
+        if state == "failed":
+            self._cell_failures[cell] = (generation, sequence)
+        return True
+
+    def cache_stale(self, cached, key=None):
+        """True when a cached completion predates a later cell failure.
+
+        A cached result for a cell is stale when its journal completion
+        sequence is not after the latest accepted failure sequence. This
+        remains true after a later clear: an older completion cannot satisfy
+        restored evidence, while a fresh completion earned after the failure
+        is immediately eligible. Results without a cell id, and generic
+        callers without sequence metadata, retain the legacy behavior.
+        """
+        if not isinstance(cached, dict):
+            return True
+        cell = cached.get("cell")
+        if not (isinstance(cell, str) and cell):
+            return False
+        failure = self._cell_failures.get(cell)
+        if failure is None:
+            return False
+        completion = self._cache_sequence.get(key) if valid_cache_key(key) else None
+        if completion is not None:
+            return completion <= failure[1]
+        current = self._cell_state.get(cell)
+        return current is not None and current[0] == "failed"
 
 
 # --------------------------------------------------------------------------
@@ -392,8 +553,22 @@ class Workflow:
         return res
 
     async def agent(self, prompt, route="glm", schema=None, label=None, dir=None, posture=None, effort=None,
-                    model=None, fallback=None, retries=2, timeout=None, fork_from=None, resume=None, files=None, add_dirs=None, openai_account=None):
-        """Dispatch one headless worker and wait for its answer."""
+                    model=None, fallback=None, retries=2, timeout=None, fork_from=None, resume=None, files=None, add_dirs=None, openai_account=None,
+                    success=None, cell=None, neighbors=None, evidence_digest=None, input_identity=None):
+        """Dispatch one headless worker and wait for its answer.
+
+        Cell-granular resume (all optional, all backwards compatible): `success`
+        is a semantic success predicate over the finished AgentResult — a
+        transport-ok reply it rejects is journaled as failed, never completed,
+        so `--resume` retries it. `cell` names one review cell, `neighbors`
+        declares the neighbor cells it was judged with, and
+        `evidence_digest`/`input_identity` carry a deterministic digest of the
+        evidence content behind the prompt; every supplied field takes part in
+        the step identity, so repaired evidence retires the old cache entry.
+        Run one such agent per cell under `parallel()` and a resume
+        redispatches only the failed or unrun cells. A cached completion
+        older than the cell's latest structured failure is never served.
+        """
         overrides = {k: v for k, v in {"dir": dir, "posture": posture, "effort": effort, "model": model, "timeout": timeout, "files": files, "add_dirs": add_dirs, "openai_account": openai_account}.items() if v is not None}
         route_name = route if isinstance(route, str) else "custom:" + hashlib.sha1(json.dumps(route, sort_keys=True).encode()).hexdigest()[:8]
         parent = fork_from.session_id if fork_from else (resume or None)
@@ -401,21 +576,33 @@ class Workflow:
         if fork_from and fork_from.openai_account != account_scope(initial_spec):
             raise WorkflowError("native fork requires the parent's OpenAI account")
         cache_overrides = dict(overrides, account_scope=account_scope(initial_spec))
-        key = step_key("agent", prompt, route_name, cache_overrides, schema, parent)
+        neighbors_norm = None
+        if neighbors is not None:
+            neighbors_norm = sorted(neighbors, key=repr) if isinstance(neighbors, (list, tuple, set)) else neighbors
+        key = step_key("agent", prompt, route_name, cache_overrides, schema, parent, cell=cell,
+                       neighbors=neighbors_norm, evidence_digest=evidence_digest, input_identity=input_identity)
         self.step_counter += 1
         label = label or f"step-{self.step_counter}"
+        cell_fields = {"cell": cell, "neighbors": neighbors_norm, "evidence_digest": evidence_digest, "input_identity": input_identity}
         cached = self.journal.cache.get(key)
         if cached:
-            self.log(f"cached: {label}")
-            r = AgentResult.from_dict(cached)
-            r.cached = True
-            return r
+            if self.journal.cache_stale(cached, key):
+                self.log(f"{label}: cached result predates a later cell failure; redispatching")
+            else:
+                r = AgentResult.from_dict(cached)
+                if success is not None and not self._semantic_ok(success, r, label):
+                    self.log(f"{label}: cached result fails the semantic success predicate; redispatching")
+                else:
+                    self.log(f"cached: {label}")
+                    r.cached = True
+                    return r
         if fallback is None:
             fallback = list(self._resolve_route(route, overrides).get("fallback", [])) if isinstance(route, str) else []
         attempt_routes = [route] + [r for r in fallback if r != route]
         self.journal.write({"type": "started", "key": key, "label": label, "route": route_name, "phase": self.phase_title, "prompt_head": prompt[:200]})
         last_error = None
         attempts = 0
+        semantic_res = None
         for rname in attempt_routes:
             spec = self._resolve_route(rname, overrides)
             rlabel = rname if isinstance(rname, str) else route_name
@@ -432,6 +619,20 @@ class Workflow:
             res, err = await self._run_with_repair(prompt, spec, rlabel, label, schema, retries, fork_from, resume, key)
             attempts += res.attempts if res is not None else 1
             if res is not None and res.ok:
+                for k, v in cell_fields.items():
+                    setattr(res, k, v)
+                if success is not None and not self._semantic_ok(success, res, label):
+                    last_error = "semantic failure: the success predicate rejected a transport-ok result"
+                    self.log(f"{label}: {last_error}")
+                    res.ok = False
+                    res.error = last_error
+                    res.attempts = attempts
+                    res.key = key
+                    res.prompt = prompt
+                    # a semantic failure is a content problem, not a route
+                    # problem: do not burn other routes, like a schema failure
+                    semantic_res = res
+                    break
                 res.attempts = attempts
                 res.key = key
                 res.prompt = prompt
@@ -442,8 +643,12 @@ class Workflow:
             if res is not None and res.error and "schema" in res.error:
                 # a schema failure is a model-output problem, not a route problem: do not burn other routes
                 break
-        failed = AgentResult(ok=False, error=last_error, route=route_name, label=label, key=key, attempts=attempts, prompt=prompt)
         self.journal.write({"type": "failed", "key": key, "label": label, "route": route_name, "error": last_error})
+        if semantic_res is not None:
+            # keep the worker's text/data/session on the returned result so
+            # the caller can report what the reviewer actually said
+            return semantic_res
+        failed = AgentResult(ok=False, error=last_error, route=route_name, label=label, key=key, attempts=attempts, prompt=prompt, **cell_fields)
         return failed
 
     # ----- internals -----
@@ -506,6 +711,16 @@ class Workflow:
             self.log(f"quota preflight blocks {qid} (exit {code})")
         self.quota_cache[cache_key] = ok
         return ok
+
+    def _semantic_ok(self, success, result, label):
+        """Evaluate the caller's semantic success predicate. A raising
+        predicate is a failure, never a pass: surfacing it as failed retries
+        the cell instead of caching a verdict nobody vouched for."""
+        try:
+            return bool(success(result))
+        except Exception as e:  # noqa: BLE001
+            self.log(f"{label}: success predicate raised {e!r}; treating as semantic failure")
+            return False
 
     async def _run_with_repair(self, prompt, spec, rlabel, label, schema, retries, fork_from, resume, key):
         """Dispatch, then on invalid structured output resume the same session

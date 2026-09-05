@@ -383,6 +383,18 @@ class TestUnits(unittest.TestCase):
         self.assertEqual(ex('[1, 2, 3]'), [1, 2, 3])
         self.assertIsNone(ex('no json here'))
 
+    def test_journal_skips_valid_json_non_mapping_garbage(self):
+        with tempfile.TemporaryDirectory(prefix="journal-unit-") as run_dir:
+            journal_path = pathlib.Path(run_dir, "journal.jsonl")
+            journal_path.write_text(
+                '[1, 2]\n"garbage"\n'
+                '{"type":"completed","key":"good","result":{"ok":true}}\n',
+                encoding="utf-8",
+            )
+            journal = self.m.Journal(run_dir)
+            self.assertEqual(journal.cache["good"], {"ok": True})
+            self.assertEqual(journal.steps["good"]["type"], "completed")
+
     def test_validate_schema(self):
         v = self.m.validate_schema
         schema = {"type": "object", "required": ["a", "b"], "properties": {

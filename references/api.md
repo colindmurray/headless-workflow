@@ -16,15 +16,21 @@ async def main(wf, args):
 return value is written to `RUN_DIR/result.json` and printed by `result`.
 
 Determinism: step identity is `sha256(kind, prompt, route name, overrides,
-schema, parent session)`. Anything that changes a prompt between runs
-(timestamps, random ids, unordered dict iteration) defeats `--resume`
-caching. Put variable inputs in `--args` and stamp outputs after the run.
+schema, parent session)`, plus the optional cell-granular fields `cell`,
+`neighbors`, `evidence_digest`, and `input_identity` when given (each takes
+part only when supplied, so keys computed without them are unchanged).
+Anything that changes a prompt between runs (timestamps, random ids,
+unordered dict iteration) defeats `--resume` caching. Put variable inputs in
+`--args` and stamp outputs after the run. When the evidence behind a prompt
+can be repaired without changing the prompt template, pass a deterministic
+digest of that evidence as `evidence_digest` (or an equivalent immutable
+`input_identity`) so the repair retires the old cache entry.
 
 ## `wf` methods
 
 | Call | Returns | Notes |
 |---|---|---|
-| `await wf.agent(prompt, route="glm", schema=None, label=None, dir=None, posture=None, effort=None, model=None, fallback=None, retries=2, timeout=None, fork_from=None, resume=None, add_dirs=None)` | `AgentResult` | Dispatches one worker through `headless-agent.sh --wait` and blocks until it answers. |
+| `await wf.agent(prompt, route="glm", schema=None, label=None, dir=None, posture=None, effort=None, model=None, fallback=None, retries=2, timeout=None, fork_from=None, resume=None, add_dirs=None, success=None, cell=None, neighbors=None, evidence_digest=None, input_identity=None)` | `AgentResult` | Dispatches one worker through `headless-agent.sh --wait` and blocks until it answers. `success` is an optional semantic success predicate over the finished result: a transport-ok reply it rejects is journaled as `failed` (never `completed`) and carries the reviewer's text/data for reporting, so `--resume` retries it. `cell` names one review cell, `neighbors` declares the neighbor cells it was judged with, and `evidence_digest`/`input_identity` pin the evidence content behind the prompt. Run one such agent per cell under `parallel()` and a resume redispatches only the failed or unrun cells. |
 | `await wf.fork(parent, prompt, **agent_opts)` | `AgentResult` | Native `--fork <parent.session_id>` when the route's harness supports it and `route` is the parent's route; otherwise fresh agent with the parent's prompt and answer prepended (`forked=False`). |
 | `await wf.parallel([thunk, ...])` | `list` | Barrier. Each thunk is a zero-arg callable returning an awaitable. A thunk that raises yields `None`. |
 | `await wf.pipeline(items, stage1, stage2, ...)` | `list` | Per-item chains with no barrier. `stage1(item, index)`, later stages `(prev, item, index)`. A raising stage or a `None` result drops that item to `None`. |
@@ -47,6 +53,7 @@ caching. Put variable inputs in `--args` and stamp outputs after the run.
 | `forked` | `True` when this result came from a native fork |
 | `error` | reason when `ok` is `False` |
 | `cached` | `True` when served from the journal on `--resume` |
+| `cell`, `neighbors`, `evidence_digest`, `input_identity` | the cell-granular identity the step was dispatched with (`None` when unused) |
 
 `result["key"]` and `result.get("key")` read from `data`.
 
@@ -111,7 +118,11 @@ Each entry:
 
 `--resume RUN_ID` reopens the same directory; steps whose key already has a
 `completed` event return the cached `AgentResult` (`cached=True`) without a
-dispatch. Edited prompts or new steps run live.
+dispatch. Edited prompts or new steps run live. A step that used `success=`
+is completed only when transport succeeds AND the predicate accepts the
+result; cached entries are re-checked against the current predicate on
+resume, so adopting a predicate retries stale transport-ok failures instead
+of serving them.
 
 ## Environment
 
