@@ -15,11 +15,13 @@ set -euo pipefail
 ROOT="${FAKE_RUN_ROOT:-${TMPDIR:-/tmp}/fake-headless}"
 mkdir -p "$ROOT"
 harness=""; provider=""; model=""; effort=""; posture=""; dir=""; prompt=""; label=""; wait=0; fork=""; resume=""
+openai_account=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --harness) harness="$2"; shift 2;;
     --provider|--ai-provider) provider="$2"; shift 2;;
     --model) model="$2"; shift 2;;
+    --openai-account) openai_account="$2"; shift 2;;
     --effort) effort="$2"; shift 2;;
     --posture) posture="$2"; shift 2;;
     --dir) dir="$2"; shift 2;;
@@ -69,6 +71,7 @@ fi
 if [[ "$prompt" == *"@@ECHO_PARENT@@"* ]]; then out="$out parent=${fork:-${resume:-none}}"; fi
 printf '%s' "$out" > "$rd/final.txt"; printf '%s\n' "$code" > "$rd/exit_code"
 end=$(date +%s.%N)
+printf '%s\n' "$openai_account" > "$rd/openai_account"
 printf '{"n":%d,"harness":"%s","provider":"%s","model":"%s","effort":"%s","posture":"%s","label":"%s","fork":"%s","resume":"%s","start":%s,"end":%s,"code":%d}\n' "$n" "$harness" "$provider" "$model" "$effort" "$posture" "$label" "$fork" "$resume" "$start" "$end" "$code" >> "$ROOT/calls.log"
 printf 'DISPATCH_ID : fake-%s\n' "$n"
 printf 'RUN_DIR : %s\nSTREAM  : %s/stream.jsonl\nFINAL   : %s/final.txt\nPID     : %s\n' "$rd" "$rd" "$rd" "$$"

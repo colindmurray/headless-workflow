@@ -104,6 +104,16 @@ built-in toolset — pi has only `read`, `bash`, `edit`, `write`, `grep`, `find`
 
 ## Fork and structured output
 
+For a named Codex/OpenAI account, pass `openai_account="aether"` to
+`wf.agent(..., route="sol")`, or put `"openai_account": "aether"` in a route
+entry. Account selection is passed to both quota preflight and headless-agent;
+quota caches and journal step keys distinguish accounts. A named account with
+unknown quota or invalid configuration is blocked. Combined quota cannot pass
+preflight. No built-in fallback selects an additional account automatically.
+The managed `sol-aether`, `terra-aether`, and `luna-aether` routes are explicit
+choices supplied by dev-environment. Other harness/provider pairs reject
+`openai_account`.
+
 `wf.fork(parent, prompt)` continues the parent's session on fork-capable
 harnesses (`claude_code`, `codex`, `opencode`, `pi`, `prime-agent`): children share
 the parent's history and cached prefix. On other harnesses it becomes a fresh

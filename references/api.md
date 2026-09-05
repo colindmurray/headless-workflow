@@ -85,6 +85,12 @@ Each entry:
   (critically limited) blocks the route, 21 (unknown) allows it with a log line.
   `--no-preflight` or `HEADLESS_WORKFLOW_NO_PREFLIGHT=1` skips all checks.
 - `max_concurrency`: per-route semaphore; `--concurrency` is the global cap.
+- `openai_account`: configured account id, only on `codex/openai`; also a
+  `wf.agent()` keyword. Both preflight and dispatch select it. Quota cache keys
+  include account and model; named-account checks fail closed. The result's
+  `openai_account` records the id (or active Codex home for unnamed routes).
+  Account changes invalidate journal hits and cannot reuse a native fork.
+  Session ids must be resumed in the home where they were created.
 - `timeout`: seconds; passed to `agy` as `--timeout`, enforced locally for all.
 - Overlay order: built-ins ← `~/.config/headless-workflow/routes.json` ←
   `--routes file` ← per-call `route={...}` dict / `posture=`, `effort=`,
