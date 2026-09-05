@@ -212,11 +212,31 @@ def validate_schema(value, schema, path="$"):
     return None
 
 
-def step_key(kind, prompt, route_name, overrides, schema, parent):
-    """Stable identity of one agent step; the journal caches results by it."""
-    payload = json.dumps({"kind": kind, "prompt": prompt, "route": route_name, "overrides": overrides or {},
-                          "schema": schema, "parent": parent}, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+def step_key(kind, prompt, route_name, overrides, schema, parent, cell=None, neighbors=None,
+             evidence_digest=None, input_identity=None):
+    """Stable identity of one agent step; the journal caches results by it.
+
+    The trailing cell-granular fields take part in the identity only when
+    given, so keys computed without them are unchanged: `cell` names one
+    review cell, `neighbors` declares the neighbor cells it was judged with,
+    and `evidence_digest`/`input_identity` carry a deterministic digest of
+    the (possibly repaired) evidence content behind the prompt. Changing any
+    supplied field retires the old cache entry and forces a fresh dispatch.
+    """
+    payload = {"kind": kind, "prompt": prompt, "route": route_name, "overrides": overrides or {},
+               "schema": schema, "parent": parent}
+    if cell is not None:
+        payload["cell"] = cell
+    if neighbors is not None:
+        try:
+            payload["neighbors"] = sorted(neighbors, key=repr) if isinstance(neighbors, (list, tuple, set)) else neighbors
+        except TypeError:
+            payload["neighbors"] = list(neighbors)
+    if evidence_digest is not None:
+        payload["evidence_digest"] = evidence_digest
+    if input_identity is not None:
+        payload["input_identity"] = input_identity
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:24]
 
 
 # --------------------------------------------------------------------------
@@ -243,6 +263,10 @@ class AgentResult:
         self.openai_account = kw.get("openai_account")
         self.model = kw.get("model")
         self.effort = kw.get("effort")
+        self.cell = kw.get("cell")
+        self.neighbors = kw.get("neighbors")
+        self.evidence_digest = kw.get("evidence_digest")
+        self.input_identity = kw.get("input_identity")
 
     def __bool__(self):
         return bool(self.ok)
@@ -258,7 +282,8 @@ class AgentResult:
         return default
 
     def to_dict(self):
-        return {k: getattr(self, k) for k in ("ok", "text", "data", "session_id", "run_dir", "route", "label", "key", "forked", "attempts", "error", "prompt", "cached", "openai_account", "model", "effort")}
+        return {k: getattr(self, k) for k in ("ok", "text", "data", "session_id", "run_dir", "route", "label", "key", "forked", "attempts", "error", "prompt", "cached", "openai_account", "model", "effort",
+                                              "cell", "neighbors", "evidence_digest", "input_identity")}
 
     @classmethod
     def from_dict(cls, d):
@@ -392,8 +417,21 @@ class Workflow:
         return res
 
     async def agent(self, prompt, route="glm", schema=None, label=None, dir=None, posture=None, effort=None,
-                    model=None, fallback=None, retries=2, timeout=None, fork_from=None, resume=None, files=None, add_dirs=None, openai_account=None):
-        """Dispatch one headless worker and wait for its answer."""
+                    model=None, fallback=None, retries=2, timeout=None, fork_from=None, resume=None, files=None, add_dirs=None, openai_account=None,
+                    success=None, cell=None, neighbors=None, evidence_digest=None, input_identity=None):
+        """Dispatch one headless worker and wait for its answer.
+
+        Cell-granular resume (all optional, all backwards compatible): `success`
+        is a semantic success predicate over the finished AgentResult — a
+        transport-ok reply it rejects is journaled as failed, never completed,
+        so `--resume` retries it. `cell` names one review cell, `neighbors`
+        declares the neighbor cells it was judged with, and
+        `evidence_digest`/`input_identity` carry a deterministic digest of the
+        evidence content behind the prompt; every supplied field takes part in
+        the step identity, so repaired evidence retires the old cache entry.
+        Run one such agent per cell under `parallel()` and a resume
+        redispatches only the failed or unrun cells.
+        """
         overrides = {k: v for k, v in {"dir": dir, "posture": posture, "effort": effort, "model": model, "timeout": timeout, "files": files, "add_dirs": add_dirs, "openai_account": openai_account}.items() if v is not None}
         route_name = route if isinstance(route, str) else "custom:" + hashlib.sha1(json.dumps(route, sort_keys=True).encode()).hexdigest()[:8]
         parent = fork_from.session_id if fork_from else (resume or None)
@@ -401,21 +439,30 @@ class Workflow:
         if fork_from and fork_from.openai_account != account_scope(initial_spec):
             raise WorkflowError("native fork requires the parent's OpenAI account")
         cache_overrides = dict(overrides, account_scope=account_scope(initial_spec))
-        key = step_key("agent", prompt, route_name, cache_overrides, schema, parent)
+        neighbors_norm = None
+        if neighbors is not None:
+            neighbors_norm = sorted(neighbors, key=repr) if isinstance(neighbors, (list, tuple, set)) else neighbors
+        key = step_key("agent", prompt, route_name, cache_overrides, schema, parent, cell=cell,
+                       neighbors=neighbors_norm, evidence_digest=evidence_digest, input_identity=input_identity)
         self.step_counter += 1
         label = label or f"step-{self.step_counter}"
+        cell_fields = {"cell": cell, "neighbors": neighbors_norm, "evidence_digest": evidence_digest, "input_identity": input_identity}
         cached = self.journal.cache.get(key)
         if cached:
-            self.log(f"cached: {label}")
             r = AgentResult.from_dict(cached)
-            r.cached = True
-            return r
+            if success is not None and not self._semantic_ok(success, r, label):
+                self.log(f"{label}: cached result fails the semantic success predicate; redispatching")
+            else:
+                self.log(f"cached: {label}")
+                r.cached = True
+                return r
         if fallback is None:
             fallback = list(self._resolve_route(route, overrides).get("fallback", [])) if isinstance(route, str) else []
         attempt_routes = [route] + [r for r in fallback if r != route]
         self.journal.write({"type": "started", "key": key, "label": label, "route": route_name, "phase": self.phase_title, "prompt_head": prompt[:200]})
         last_error = None
         attempts = 0
+        semantic_res = None
         for rname in attempt_routes:
             spec = self._resolve_route(rname, overrides)
             rlabel = rname if isinstance(rname, str) else route_name
@@ -432,6 +479,20 @@ class Workflow:
             res, err = await self._run_with_repair(prompt, spec, rlabel, label, schema, retries, fork_from, resume, key)
             attempts += res.attempts if res is not None else 1
             if res is not None and res.ok:
+                for k, v in cell_fields.items():
+                    setattr(res, k, v)
+                if success is not None and not self._semantic_ok(success, res, label):
+                    last_error = "semantic failure: the success predicate rejected a transport-ok result"
+                    self.log(f"{label}: {last_error}")
+                    res.ok = False
+                    res.error = last_error
+                    res.attempts = attempts
+                    res.key = key
+                    res.prompt = prompt
+                    # a semantic failure is a content problem, not a route
+                    # problem: do not burn other routes, like a schema failure
+                    semantic_res = res
+                    break
                 res.attempts = attempts
                 res.key = key
                 res.prompt = prompt
@@ -442,8 +503,12 @@ class Workflow:
             if res is not None and res.error and "schema" in res.error:
                 # a schema failure is a model-output problem, not a route problem: do not burn other routes
                 break
-        failed = AgentResult(ok=False, error=last_error, route=route_name, label=label, key=key, attempts=attempts, prompt=prompt)
         self.journal.write({"type": "failed", "key": key, "label": label, "route": route_name, "error": last_error})
+        if semantic_res is not None:
+            # keep the worker's text/data/session on the returned result so
+            # the caller can report what the reviewer actually said
+            return semantic_res
+        failed = AgentResult(ok=False, error=last_error, route=route_name, label=label, key=key, attempts=attempts, prompt=prompt, **cell_fields)
         return failed
 
     # ----- internals -----
@@ -506,6 +571,16 @@ class Workflow:
             self.log(f"quota preflight blocks {qid} (exit {code})")
         self.quota_cache[cache_key] = ok
         return ok
+
+    def _semantic_ok(self, success, result, label):
+        """Evaluate the caller's semantic success predicate. A raising
+        predicate is a failure, never a pass: surfacing it as failed retries
+        the cell instead of caching a verdict nobody vouched for."""
+        try:
+            return bool(success(result))
+        except Exception as e:  # noqa: BLE001
+            self.log(f"{label}: success predicate raised {e!r}; treating as semantic failure")
+            return False
 
     async def _run_with_repair(self, prompt, spec, rlabel, label, schema, retries, fork_from, resume, key):
         """Dispatch, then on invalid structured output resume the same session
