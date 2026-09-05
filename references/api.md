@@ -42,6 +42,7 @@ caching. Put variable inputs in `--args` and stamp outputs after the run.
 | `session_id` | native session id from `RUN_DIR/session_id`; feed to `fork()` / `resume=` |
 | `run_dir` | the provider run directory (stream, stderr, meta) |
 | `route` | route name actually used (after fallback) |
+| `model`, `effort` | model and effort sent to the dispatcher; same-route forks inherit them unless explicitly overridden |
 | `attempts` | dispatches consumed, including repairs and fallbacks |
 | `forked` | `True` when this result came from a native fork |
 | `error` | reason when `ok` is `False` |
