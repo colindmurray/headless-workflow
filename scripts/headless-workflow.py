@@ -330,13 +330,19 @@ class Journal:
         mapping-shaped result before it may touch the cache or the step
         table; anything else -- missing result, invalid or unhashable key,
         non-mapping result, malformed duplicates -- is ignored, so it can
-        never crash recovery or overwrite an established good entry. Other
-        records need a non-empty string key for the step table.
-        `allow_cache` stays replay-only: live writes never populate the
-        cache, preserving the rule that only a fresh `--resume` replay
+        never crash recovery or overwrite an established good entry. A
+        `cell-state` record is a validated, non-step event: it goes only to
+        the structured cell lifecycle, never to the step table, even when it
+        carries a key, so a rejected record cannot smuggle `key=poison` into
+        the steps. Other records need a non-empty string key for the step
+        table. `allow_cache` stays replay-only: live writes never populate
+        the cache, preserving the rule that only a fresh `--resume` replay
         serves cached steps.
         """
         if not isinstance(event, dict):
+            return
+        if event.get("type") == "cell-state":
+            self._note_cell_state(event, sequence)
             return
         key = event.get("key")
         if event.get("type") == "completed":
@@ -350,28 +356,31 @@ class Journal:
             return
         if valid_cache_key(key):
             self.steps[key] = event
-        self._note_cell_state(event, sequence)
 
     def _note_cell_state(self, event, sequence):
         """Track the latest structured cell lifecycle per explicit cell id.
 
         A `cell-state` record carries `cell`, `state` ("failed"/"passed"),
-        and a monotonic `generation`; the highest generation always wins and
-        equal generations keep the first record, so delayed or duplicated
-        lower-generation events can never regress observed state. Failure
-        generations retain their journal sequence, allowing cache eligibility
-        to compare a completion with the failure that followed it even after
-        a later clear. Anything else -- non-string or empty ids, unknown
-        states, non-integer or negative generations, or malformed metadata -- is ignored
-        safely and can never crash on unhashable values. Updated on every live
-        write as well as on replay, so a failure recorded mid-run is visible
-        to later serve checks in the same Journal instance.
+        and an explicitly present monotonic `generation` -- an int that is
+        not a bool and is >= 0, with explicit zero accepted; the highest
+        generation always wins and equal generations keep the first record,
+        so delayed or duplicated lower-generation events can never regress
+        observed state. Failure generations retain their journal sequence,
+        allowing cache eligibility to compare a completion with the failure
+        that followed it even after a later clear. Anything else -- missing
+        or malformed generations, non-string or empty ids, unknown states,
+        or malformed metadata -- is ignored safely and can never crash on
+        unhashable values. Updated on every live write as well as on replay,
+        so a failure recorded mid-run is visible to later serve checks in
+        the same Journal instance.
         """
         if event.get("type") != "cell-state":
             return
         cell = event.get("cell")
         state = event.get("state")
-        generation = event.get("generation", 0)
+        if "generation" not in event:
+            return
+        generation = event.get("generation")
         if not (isinstance(cell, str) and cell):
             return
         if state not in ("failed", "passed"):
