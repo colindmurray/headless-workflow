@@ -362,7 +362,7 @@ class Journal:
         generations retain their journal sequence, allowing cache eligibility
         to compare a completion with the failure that followed it even after
         a later clear. Anything else -- non-string or empty ids, unknown
-        states, non-integer generations, or malformed metadata -- is ignored
+        states, non-integer or negative generations, or malformed metadata -- is ignored
         safely and can never crash on unhashable values. Updated on every live
         write as well as on replay, so a failure recorded mid-run is visible
         to later serve checks in the same Journal instance.
@@ -376,7 +376,8 @@ class Journal:
             return
         if state not in ("failed", "passed"):
             return
-        if not isinstance(generation, int) or isinstance(generation, bool):
+        if (not isinstance(generation, int) or isinstance(generation, bool)
+                or generation < 0):
             return
         if "label" in event and not isinstance(event["label"], str):
             return

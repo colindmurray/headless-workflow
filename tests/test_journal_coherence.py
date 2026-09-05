@@ -128,6 +128,19 @@ class TestOrderedEligibility(unittest.TestCase):
     def setUp(self):
         self.m = load_module()
 
+    def mutant_module(self, old, new):
+        source = SCRIPT.read_text()
+        self.assertIn(old, source, "negative-generation mutation anchor drifted")
+        path = pathlib.Path(tempfile.mkdtemp(prefix="journal-mutant-")) / "headless-workflow.py"
+        path.write_text(source.replace(old, new, 1))
+        return load_module(path)
+
+    def journal_with(self, lines):
+        run_dir = tempfile.mkdtemp(prefix="journal-coherence-")
+        with open(os.path.join(run_dir, "journal.jsonl"), "w") as fh:
+            fh.write("".join(lines))
+        return self.m.Journal(run_dir)
+
     def test_stale_completion_skipped_until_cleared(self):
         run_dir = tempfile.mkdtemp(prefix="journal-coherence-")
         with open(os.path.join(run_dir, "journal.jsonl"), "w") as fh:
@@ -168,6 +181,41 @@ class TestOrderedEligibility(unittest.TestCase):
         self.assertEqual(journal._cell_state, {"B": ("failed", 4)})
         self.assertTrue(journal.cache_stale({"ok": True, "cell": "B"}))
 
+    def test_negative_generation_never_invalidates_completion(self):
+        journal = self.journal_with([
+            '{"type": "completed", "key": "k", "label": "b",'
+            ' "result": {"ok": true, "cell": "B"}}\n',
+            '{"type": "cell-state", "cell": "B", "state": "failed",'
+            ' "generation": -1, "label": "b"}\n',
+        ])
+        self.assertEqual(journal._cell_state, {})
+        self.assertEqual(journal._cell_failures, {})
+        self.assertFalse(journal.cache_stale(journal.cache["k"], "k"))
+
+    def test_malformed_generations_never_overwrite_good_state(self):
+        journal = self.journal_with([
+            '{"type": "cell-state", "cell": "B", "state": "failed",'
+            ' "generation": 3, "label": "b"}\n',
+        ])
+        self.assertEqual(journal._cell_state, {"B": ("failed", 3)})
+        bad = [-1, -2147483648, -9223372036854775808, True, False,
+               1.5, "3", None, [3], {"n": 3}]
+        for i, generation in enumerate(bad):
+            journal._ingest({"type": "cell-state", "cell": "B",
+                             "state": "failed", "generation": generation},
+                            True, 100 + i)
+        journal._ingest({"type": "cell-state", "cell": "B", "state": "failed",
+                         "generation": 9, "reason": ["bad"]}, True, 200)
+        journal._ingest({"type": "cell-state", "cell": "B", "state": "passed",
+                         "generation": -1}, True, 201)
+        self.assertEqual(journal._cell_state, {"B": ("failed", 3)})
+        failure = journal._cell_failures.get("B")
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure[0], 3)
+        journal._ingest({"type": "cell-state", "cell": "B", "state": "passed",
+                         "generation": 4}, True, 202)
+        self.assertEqual(journal._cell_state, {"B": ("passed", 4)})
+
     def test_stale_completion_redispatched_on_resume(self):
         h = Harness()
         body = """
@@ -194,6 +242,49 @@ class TestOrderedEligibility(unittest.TestCase):
                      ' "generation": 2, "label": "review-b"}\n')
         h.run("run", script, "--resume", run_id)
         self.assertEqual(len(h.calls()), 2, "cleared completion serves again")
+
+    def test_negative_generation_completion_served_on_resume(self):
+        h = Harness()
+        body = """
+        META = {"name": "cell-b", "description": "cell-b"}
+        async def main(wf, args):
+            r = await wf.agent("review B @@REPLY:ok@@", route="glm",
+                               label="review-b", cell="B")
+            return {"ok": r.ok, "session": r.session_id, "cached": r.cached}
+        """
+        script = h.write_script(body)
+        run_id = h.run_id_from(h.run("run", script))
+        first = h.result(run_id)
+        self.assertEqual(len(h.calls()), 1)
+        run_dir = os.path.join(h.state, "runs", run_id)
+        with open(os.path.join(run_dir, "journal.jsonl"), "a") as fh:
+            fh.write('{"type": "cell-state", "cell": "B", "state": "failed",'
+                     ' "generation": -1, "label": "review-b"}\n')
+        h.run("run", script, "--resume", run_id)
+        self.assertEqual(
+            len(h.calls()), 1,
+            "negative-generation state must not invalidate the good completion")
+        second = h.result(run_id)
+        self.assertEqual(second["session"], first["session"])
+
+    def test_mutation_negative_generation_guard_removed_invalidates_completion(self):
+        mutant = self.mutant_module(
+            "        if (not isinstance(generation, int) or isinstance(generation, bool)\n"
+            "                or generation < 0):",
+            "        if (not isinstance(generation, int) or isinstance(generation, bool)\n"
+            "                or False):",
+        )
+        run_dir = tempfile.mkdtemp(prefix="journal-mutant-run-")
+        journal_path = pathlib.Path(run_dir) / "journal.jsonl"
+        journal_path.write_text(
+            '{"type": "completed", "key": "k", "result": '
+            '{"ok": true, "cell": "B"}}\n'
+            '{"type": "cell-state", "cell": "B", "state": "failed", '
+            '"generation": -1}\n'
+        )
+        journal = mutant.Journal(run_dir)
+        self.assertEqual(journal._cell_state, {"B": ("failed", -1)})
+        self.assertTrue(journal.cache_stale(journal.cache["k"], "k"))
 
 
 if __name__ == "__main__":
