@@ -294,6 +294,11 @@ def valid_cache_key(key):
     return isinstance(key, str) and len(key) > 0
 
 
+GENERIC_EVENT_TYPES = frozenset((
+    "phase", "run-started", "run-finished", "started", "completed", "failed",
+))
+
+
 class Journal:
     def __init__(self, run_dir):
         self.run_dir = run_dir
@@ -306,102 +311,122 @@ class Journal:
         self._sequence = 0
         if os.path.exists(self.path):
             with open(self.path) as fh:
-                for sequence, line in enumerate(fh, 1):
-                    self._sequence = sequence
+                for line in fh:
                     try:
                         e = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    self._ingest(e, allow_cache=True, sequence=sequence)
+                    if self._ingest(e, allow_cache=True,
+                                    sequence=self._sequence + 1):
+                        self._sequence += 1
 
     def write(self, event):
         event = dict(event)
         event["at"] = now_iso()
         with open(self.path, "a") as fh:
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
-        self._sequence += 1
-        self._ingest(event, allow_cache=False, sequence=self._sequence)
+        if self._ingest(event, allow_cache=False, sequence=self._sequence + 1):
+            self._sequence += 1
 
     def _ingest(self, event, allow_cache, sequence):
-        """Validate before any cache/steps/state mutation.
+        """Classify, validate, then project -- atomically.
 
-        Shared by file replay and live writes so both observe identical
-        state. A `completed` record needs a non-empty string key and a
-        mapping-shaped result before it may touch the cache or the step
-        table; anything else -- missing result, invalid or unhashable key,
-        non-mapping result, malformed duplicates -- is ignored, so it can
-        never crash recovery or overwrite an established good entry. A
-        `cell-state` record is a validated, non-step event: it goes only to
-        the structured cell lifecycle, never to the step table, even when it
-        carries a key, so a rejected record cannot smuggle `key=poison` into
-        the steps. Other records need a non-empty string key for the step
-        table. `allow_cache` stays replay-only: live writes never populate
-        the cache, preserving the rule that only a fresh `--resume` replay
-        serves cached steps.
+        The event kind is classified first: anything claiming the
+        structured cell lifecycle -- exact type `cell-state`, or a top-level
+        `cell`/`generation` marker -- is fully validated as a non-step
+        event and can never fall through into the generic step table, even
+        with a valid key. A `completed` record needs a non-empty string key
+        and a mapping-shaped result before it may touch the cache or the
+        step table. Other string-typed records need a non-empty string key
+        for the step table. Anything else -- missing, null, or numeric
+        types, missing result, invalid or unhashable keys, non-mapping
+        results, malformed duplicates -- is ignored, so it can never crash
+        recovery, smuggle `key=poison` into the steps, or overwrite an
+        established good entry. Returns True exactly when a projection was
+        applied, so callers advance the logical `_sequence` only for
+        accepted events. Shared by file replay and live writes so both
+        observe identical state. `allow_cache` stays replay-only: live
+        writes never populate the cache, preserving the rule that only a
+        fresh `--resume` replay serves cached steps.
         """
         if not isinstance(event, dict):
-            return
-        if event.get("type") == "cell-state":
-            self._note_cell_state(event, sequence)
-            return
+            return False
+        kind = event.get("type")
+        if kind == "cell-state" or "cell" in event or "generation" in event:
+            return self._note_cell_state(event, sequence)
+        if not isinstance(kind, str) or kind not in GENERIC_EVENT_TYPES:
+            return False
         key = event.get("key")
-        if event.get("type") == "completed":
+        if kind in ("phase", "run-started", "run-finished"):
+            if "key" not in event:
+                return True
+            if valid_cache_key(key):
+                self.steps[key] = event
+                return True
+            return False
+        if kind == "completed":
             result = event.get("result")
             if not (valid_cache_key(key) and isinstance(result, dict)):
-                return
+                return False
             if allow_cache:
                 self.cache[key] = result
                 self._cache_sequence[key] = sequence
             self.steps[key] = event
-            return
+            return True
         if valid_cache_key(key):
             self.steps[key] = event
+            return True
+        return False
 
     def _note_cell_state(self, event, sequence):
         """Track the latest structured cell lifecycle per explicit cell id.
 
         A `cell-state` record carries `cell`, `state` ("failed"/"passed"),
         and an explicitly present monotonic `generation` -- an int that is
-        not a bool and is >= 0, with explicit zero accepted; the highest
-        generation always wins and equal generations keep the first record,
-        so delayed or duplicated lower-generation events can never regress
-        observed state. Failure generations retain their journal sequence,
+        not a bool and is >= 0, with explicit zero accepted. Acceptance is
+        one ordering decision shared by every projection: only a generation
+        strictly newer than the established one updates `_cell_state`, and
+        only that same accepted record may update `_cell_failures` -- equal,
+        lower, delayed, duplicate, or malformed events update neither
+        projection, failure ordering, cache eligibility, nor the logical
+        sequence. Failure generations retain their journal sequence,
         allowing cache eligibility to compare a completion with the failure
         that followed it even after a later clear. Anything else -- missing
         or malformed generations, non-string or empty ids, unknown states,
         or malformed metadata -- is ignored safely and can never crash on
-        unhashable values. Updated on every live write as well as on replay,
-        so a failure recorded mid-run is visible to later serve checks in
-        the same Journal instance.
+        unhashable values. Returns True exactly when the record was
+        accepted. Updated on every live write as well as on replay, so a
+        failure recorded mid-run is visible to later serve checks in the
+        same Journal instance.
         """
         if event.get("type") != "cell-state":
-            return
+            return False
         cell = event.get("cell")
         state = event.get("state")
         if "generation" not in event:
-            return
+            return False
         generation = event.get("generation")
         if not (isinstance(cell, str) and cell):
-            return
+            return False
         if state not in ("failed", "passed"):
-            return
+            return False
         if (not isinstance(generation, int) or isinstance(generation, bool)
                 or generation < 0):
-            return
+            return False
         if "label" in event and not isinstance(event["label"], str):
-            return
+            return False
         if "reason" in event and not isinstance(event["reason"], str):
-            return
+            return False
         if ("evidence_state" in event
                 and event["evidence_state"] not in ("ok", "absent", "unreadable")):
-            return
+            return False
         current = self._cell_state.get(cell)
-        if current is None or generation > current[1]:
-            self._cell_state[cell] = (state, generation)
+        if current is not None and generation <= current[1]:
+            return False
+        self._cell_state[cell] = (state, generation)
         if state == "failed":
-            failure = self._cell_failures.get(cell)
-            if failure is None or generation > failure[0]:
-                self._cell_failures[cell] = (generation, sequence)
+            self._cell_failures[cell] = (generation, sequence)
+        return True
 
     def cache_stale(self, cached, key=None):
         """True when a cached completion predates a later cell failure.

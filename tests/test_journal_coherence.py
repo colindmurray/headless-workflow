@@ -335,6 +335,177 @@ class TestOrderedEligibility(unittest.TestCase):
         second = h.result(run_id)
         self.assertEqual(second["session"], first["session"])
 
+    def test_atomic_acceptance_equal_failure_ignored(self):
+        journal = self.journal_with([
+            '{"type": "cell-state", "cell": "B", "state": "failed",'
+            ' "generation": 1}\n',
+            '{"type": "completed", "key": "k", "label": "b",'
+            ' "result": {"ok": true, "cell": "B"}}\n',
+            '{"type": "cell-state", "cell": "B", "state": "passed",'
+            ' "generation": 2}\n',
+            '{"type": "cell-state", "cell": "B", "state": "failed",'
+            ' "generation": 2}\n',
+        ])
+        self.assertEqual(journal._cell_state, {"B": ("passed", 2)})
+        self.assertEqual(list(journal._cell_failures), ["B"])
+        self.assertEqual(journal._cell_failures["B"][0], 1)
+        self.assertFalse(journal.cache_stale(journal.cache["k"], "k"))
+        self.assertEqual(journal._sequence, 3)
+
+    def test_atomic_acceptance_lower_failure_ignored(self):
+        journal = self.journal_with([
+            '{"type": "cell-state", "cell": "B", "state": "failed",'
+            ' "generation": 1}\n',
+            '{"type": "completed", "key": "k", "label": "b",'
+            ' "result": {"ok": true, "cell": "B"}}\n',
+            '{"type": "cell-state", "cell": "B", "state": "passed",'
+            ' "generation": 3}\n',
+            '{"type": "cell-state", "cell": "B", "state": "failed",'
+            ' "generation": 2}\n',
+        ])
+        self.assertEqual(journal._cell_state, {"B": ("passed", 3)})
+        self.assertEqual(journal._cell_failures["B"][0], 1)
+        self.assertFalse(journal.cache_stale(journal.cache["k"], "k"))
+        self.assertEqual(journal._sequence, 3)
+
+    def test_ordering_matrix(self):
+        # The completion leads every row, so any recorded failure makes it
+        # stale; the atomicity signal is the failure generation, which must
+        # never advance past the accepted state generation. Freshness past
+        # an ignored failure needs a completion earned after it -- covered
+        # by the atomic acceptance tests above.
+        cases = [
+            ("higher failed advances",
+             [("failed", 1)], ("failed", 1), 1, True),
+            ("higher passed clears state only",
+             [("failed", 1), ("passed", 2)], ("passed", 2), 1, True),
+            ("equal failed ignored",
+             [("failed", 1), ("passed", 2), ("failed", 2)],
+             ("passed", 2), 1, True),
+            ("lower failed ignored",
+             [("failed", 1), ("passed", 3), ("failed", 2)],
+             ("passed", 3), 1, True),
+            ("exact duplicate ignored",
+             [("failed", 2), ("failed", 2)], ("failed", 2), 2, True),
+            ("equal passed keeps first failure",
+             [("failed", 2), ("passed", 2)], ("failed", 2), 2, True),
+            ("equal failed keeps first pass",
+             [("passed", 2), ("failed", 2)], ("passed", 2), None, False),
+            ("delayed lower passed ignored",
+             [("failed", 3), ("passed", 1)], ("failed", 3), 3, True),
+            ("higher failed after pass advances",
+             [("passed", 1), ("failed", 2)], ("failed", 2), 2, True),
+        ]
+        for name, events, state, failure_gen, keyed_stale in cases:
+            with self.subTest(name=name):
+                lines = ['{"type": "completed", "key": "k", "label": "b",'
+                         ' "result": {"ok": true, "cell": "B"}}\n']
+                for cell_state, generation in events:
+                    lines.append(
+                        '{"type": "cell-state", "cell": "B", "state": "%s",'
+                        ' "generation": %d}\n' % (cell_state, generation))
+                journal = self.journal_with(lines)
+                self.assertEqual(journal._cell_state, {"B": state}, name)
+                if failure_gen is None:
+                    self.assertEqual(journal._cell_failures, {}, name)
+                else:
+                    self.assertEqual(
+                        journal._cell_failures["B"][0], failure_gen, name)
+                self.assertEqual(
+                    journal.cache_stale(journal.cache["k"], "k"),
+                    keyed_stale, name)
+
+    def test_keyed_invalid_types_rejected_from_steps(self):
+        journal = self.journal_with([
+            '{"type": "completed", "key": "k", "label": "b",'
+            ' "result": {"ok": true, "cell": "B"}}\n',
+            '{"cell": "B", "state": "failed", "generation": 3,'
+            ' "key": "poison"}\n',
+            '{"type": "failed", "cell": "B", "state": "failed",'
+            ' "generation": 3, "key": "poison"}\n',
+            '{"type": null, "cell": "B", "state": "failed",'
+            ' "generation": 3, "key": "poison"}\n',
+            '{"type": 5, "cell": "B", "state": "failed",'
+            ' "generation": 3, "key": "poison"}\n',
+            '{"type": "cell-state", "cell": [], "state": "failed",'
+            ' "generation": 9, "key": "poison"}\n',
+            '{"type": "cell-state", "cell": "B", "state": "bogus",'
+            ' "generation": 9, "key": "poison"}\n',
+            '{"type": "cell-state", "cell": "B", "state": "failed",'
+            ' "generation": -1, "key": "poison"}\n',
+            '{"type": null, "key": "poison"}\n',
+            '{"type": 5, "key": "poison"}\n',
+        ])
+        self.assertEqual(list(journal.steps), ["k"])
+        self.assertEqual(journal._cell_state, {})
+        self.assertEqual(journal._cell_failures, {})
+        self.assertFalse(journal.cache_stale(journal.cache["k"], "k"))
+        self.assertEqual(journal._sequence, 1)
+        self.assertEqual(journal._cache_sequence, {"k": 1})
+
+    def test_replay_sequence_counts_only_accepted(self):
+        journal = self.journal_with([
+            '{"type": "completed", "key": "k", "label": "b",'
+            ' "result": {"ok": true, "cell": "B"}}\n',
+            '{"type": "cell-state", "cell": "B", "state": "failed"}\n',
+            '{"type": "cell-state", "cell": "B", "state": "failed",'
+            ' "generation": 1}\n',
+            'not json\n',
+            '[1, 2]\n',
+            '{"type": "cell-state", "cell": "B", "state": "failed",'
+            ' "generation": 1}\n',
+            '{"type": "cell-state", "cell": "B", "state": "passed",'
+            ' "generation": 2}\n',
+        ])
+        self.assertEqual(journal._sequence, 3)
+        self.assertEqual(journal._cache_sequence, {"k": 1})
+        self.assertEqual(journal._cell_state, {"B": ("passed", 2)})
+        self.assertEqual(journal._cell_failures, {"B": (1, 2)})
+        self.assertTrue(journal.cache_stale(journal.cache["k"], "k"))
+        self.assertFalse(journal.cache_stale(journal.cache["k"]))
+
+    def test_repeated_malformed_replay_leaves_sequence(self):
+        lines = ['{"type": "completed", "key": "k", "label": "b",'
+                 ' "result": {"ok": true, "cell": "B"}}\n']
+        lines += ['{"type": "cell-state", "cell": "B", "state": "failed"}\n'] * 3
+        journal = self.journal_with(lines)
+        self.assertEqual(journal._sequence, 1)
+        self.assertEqual(journal._cell_state, {})
+        self.assertFalse(journal.cache_stale(journal.cache["k"], "k"))
+
+    def test_legitimate_generic_events_retained(self):
+        run_dir = tempfile.mkdtemp(prefix="journal-coherence-")
+        journal = self.m.Journal(run_dir)
+        self.assertTrue(journal._ingest(
+            {"type": "phase", "title": "p"}, False, 99))
+        self.assertTrue(journal._ingest(
+            {"type": "started", "key": "s", "label": "a"}, False, 99))
+        self.assertTrue(journal._ingest(
+            {"type": "failed", "key": "bad", "label": "a", "error": "x"},
+            False, 99))
+        self.assertTrue(journal._ingest(
+            {"type": "run-started", "key": "rs", "resumed": False},
+            False, 99))
+        self.assertTrue(journal._ingest(
+            {"type": "run-finished", "key": "rf", "status": "ok",
+             "dispatched": 1}, False, 99))
+        self.assertTrue(journal._ingest(
+            {"type": "completed", "key": "good", "label": "a",
+             "result": {"ok": True}}, False, 99))
+        self.assertEqual(
+            sorted(journal.steps), ["bad", "good", "rf", "rs", "s"])
+        self.assertTrue(journal._ingest({"type": "phase"}, False, 99))
+        self.assertFalse(journal._ingest({"key": "orphan"}, False, 99))
+
+    def test_legitimate_projectionless_generics_advance_sequence(self):
+        run_dir = tempfile.mkdtemp(prefix="journal-coherence-")
+        journal = self.m.Journal(run_dir)
+        journal.write({"type": "phase", "title": "p"})
+        journal.write({"type": "run-started", "resumed": False})
+        journal.write({"type": "run-finished", "status": "ok"})
+        self.assertEqual(journal._sequence, 3)
+        self.assertEqual(journal.steps, {})
+
     def test_mutation_negative_generation_guard_removed_invalidates_completion(self):
         mutant = self.mutant_module(
             "        if (not isinstance(generation, int) or isinstance(generation, bool)\n"
@@ -357,7 +528,7 @@ class TestOrderedEligibility(unittest.TestCase):
     def test_mutation_generation_presence_removed_accepts_missing(self):
         mutant = self.mutant_module(
             '        if "generation" not in event:\n'
-            "            return\n"
+            "            return False\n"
             '        generation = event.get("generation")',
             '        generation = event.get("generation", 0)',
         )
@@ -393,10 +564,9 @@ class TestOrderedEligibility(unittest.TestCase):
 
     def test_mutation_cell_state_step_branch_restored_poisons_steps(self):
         mutant = self.mutant_module(
-            '        if event.get("type") == "cell-state":\n'
-            "            self._note_cell_state(event, sequence)\n"
-            "            return\n",
-            "        if False:  # MUTANT: cell-state step branch restored\n"
+            '        if kind == "cell-state" or "cell" in event or "generation" in event:\n'
+            "            return self._note_cell_state(event, sequence)\n",
+            "        if False:  # MUTANT: classification removed\n"
             "            pass\n",
         )
         run_dir = tempfile.mkdtemp(prefix="journal-mutant-run-")
@@ -404,7 +574,7 @@ class TestOrderedEligibility(unittest.TestCase):
         journal_path.write_text(
             '{"type": "completed", "key": "k", "result": '
             '{"ok": true, "cell": "B"}}\n'
-            '{"type": "cell-state", "cell": "B", "state": "failed", '
+            '{"type": "failed", "cell": "B", "state": "failed", '
             '"generation": -1, "key": "poison"}\n'
         )
         journal = mutant.Journal(run_dir)
@@ -413,10 +583,10 @@ class TestOrderedEligibility(unittest.TestCase):
     def test_mutation_metadata_check_reordered_mutates_before_validate(self):
         mutant = self.mutant_module(
             '        if "label" in event and not isinstance(event["label"], str):\n'
-            "            return\n",
+            "            return False\n",
             "        self._cell_state[cell] = (state, generation)  # MUTANT: premature\n"
             '        if "label" in event and not isinstance(event["label"], str):\n'
-            "            return\n",
+            "            return False\n",
         )
         run_dir = tempfile.mkdtemp(prefix="journal-mutant-run-")
         journal_path = pathlib.Path(run_dir) / "journal.jsonl"
@@ -426,6 +596,100 @@ class TestOrderedEligibility(unittest.TestCase):
         )
         journal = mutant.Journal(run_dir)
         self.assertEqual(journal._cell_state, {"B": ("failed", 9)})
+
+    def test_mutation_partial_acceptance_state_without_failure(self):
+        mutant = self.mutant_module(
+            "        self._cell_state[cell] = (state, generation)\n"
+            '        if state == "failed":\n'
+            "            self._cell_failures[cell] = (generation, sequence)\n"
+            "        return True",
+            "        self._cell_state[cell] = (state, generation)\n"
+            "        return True  # MUTANT: failure projection dropped",
+        )
+        run_dir = tempfile.mkdtemp(prefix="journal-mutant-run-")
+        journal_path = pathlib.Path(run_dir) / "journal.jsonl"
+        journal_path.write_text(
+            '{"type": "completed", "key": "k", "result": '
+            '{"ok": true, "cell": "B"}}\n'
+            '{"type": "cell-state", "cell": "B", "state": "failed", '
+            '"generation": 1}\n'
+        )
+        journal = mutant.Journal(run_dir)
+        self.assertEqual(journal._cell_state, {"B": ("failed", 1)})
+        self.assertEqual(journal._cell_failures, {})
+        self.assertFalse(journal.cache_stale(journal.cache["k"], "k"))
+
+    def test_mutation_split_ordering_failure_without_gate(self):
+        mutant = self.mutant_module(
+            "        current = self._cell_state.get(cell)\n"
+            "        if current is not None and generation <= current[1]:\n"
+            "            return False\n"
+            "        self._cell_state[cell] = (state, generation)\n"
+            '        if state == "failed":\n'
+            "            self._cell_failures[cell] = (generation, sequence)\n"
+            "        return True",
+            "        current = self._cell_state.get(cell)\n"
+            "        if current is None or generation > current[1]:\n"
+            "            self._cell_state[cell] = (state, generation)\n"
+            '        if state == "failed":  # MUTANT: split ordering\n'
+            "            failure = self._cell_failures.get(cell)\n"
+            "            if failure is None or generation > failure[0]:\n"
+            "                self._cell_failures[cell] = (generation, sequence)\n"
+            "        return True",
+        )
+        run_dir = tempfile.mkdtemp(prefix="journal-mutant-run-")
+        journal_path = pathlib.Path(run_dir) / "journal.jsonl"
+        journal_path.write_text(
+            '{"type": "completed", "key": "k", "result": '
+            '{"ok": true, "cell": "B"}}\n'
+            '{"type": "cell-state", "cell": "B", "state": "failed", '
+            '"generation": 1}\n'
+            '{"type": "cell-state", "cell": "B", "state": "passed", '
+            '"generation": 2}\n'
+            '{"type": "cell-state", "cell": "B", "state": "failed", '
+            '"generation": 2}\n'
+        )
+        journal = mutant.Journal(run_dir)
+        self.assertEqual(journal._cell_state, {"B": ("passed", 2)})
+        self.assertEqual(journal._cell_failures["B"][0], 2)
+        self.assertTrue(journal.cache_stale(journal.cache["k"], "k"))
+
+    def test_mutation_replay_sequence_unconditional(self):
+        mutant = self.mutant_module(
+            "                    if self._ingest(e, allow_cache=True,\n"
+            "                                    sequence=self._sequence + 1):\n"
+            "                        self._sequence += 1",
+            "                    self._ingest(e, allow_cache=True,  # MUTANT\n"
+            "                                 sequence=self._sequence + 1)\n"
+            "                    self._sequence += 1",
+        )
+        run_dir = tempfile.mkdtemp(prefix="journal-mutant-run-")
+        journal_path = pathlib.Path(run_dir) / "journal.jsonl"
+        journal_path.write_text(
+            '{"type": "completed", "key": "k", "result": '
+            '{"ok": true, "cell": "B"}}\n'
+            '{"type": "cell-state", "cell": "B", "state": "failed"}\n'
+        )
+        journal = mutant.Journal(run_dir)
+        self.assertEqual(journal._sequence, 2)
+
+    def test_mutation_overbroad_rejection_drops_generic(self):
+        mutant = self.mutant_module(
+            "        if valid_cache_key(key):\n"
+            "            self.steps[key] = event\n"
+            "            return True\n"
+            "        return False",
+            "        if False:  # MUTANT: generic projection dropped\n"
+            "            self.steps[key] = event\n"
+            "        return False",
+        )
+        run_dir = tempfile.mkdtemp(prefix="journal-mutant-run-")
+        journal_path = pathlib.Path(run_dir) / "journal.jsonl"
+        journal_path.write_text(
+            '{"type": "failed", "key": "bad", "label": "a", "error": "x"}\n'
+        )
+        journal = mutant.Journal(run_dir)
+        self.assertEqual(journal.steps, {})
 
 
 if __name__ == "__main__":
