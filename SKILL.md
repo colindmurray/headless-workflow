@@ -62,7 +62,8 @@ The run prints `RUN_ID`, `RUN_DIR`, and `LOG` first, then blocks until
 
 `python3 "$HW" routes` prints the effective table. Built-ins: `glm`,
 `gemini`, `muse`, `kimi`, `deepseek` (cheap workers), `sonnet`, `opus`,
-`luna`, `terra`, `sol` (judgment), and `pi-glm`, `pi-muse`, `pi-sol` (the
+`luna`, `terra`, `sol` (judgment), `astra` (cautious frontier escalation), and
+`pi-glm`, `pi-muse`, `pi-sol` (the
 same providers through the minimal `pi` harness). Each carries harness/provider/model,
 effort, posture, `max_concurrency`, a quota id for the `check-ai-quota`
 preflight (exit 20/22 skips the route), and a `fallback` list tried in order
@@ -73,6 +74,15 @@ text default, whose stream carries no structured usage. Override or add routes i
 merge), or pass a dict: `route={"harness": "kimi_code", "provider": "kimi",
 "model": "k3"}`. `gemini` defaults to posture `code` because `agy` in review
 posture is denied file reads.
+
+`astra` selects `gpt-6-astra` at medium, concurrency 1, JSON output for token
+accounting, and no fallback. Agents may select it without Colin's permission
+when `route-ai-work` justifies its premium; do not use it for speculative bulk
+fan-out. It spends the chosen account's shared OpenAI allowance at 2.5x Sol's
+Standard token rates. Codex supports low/medium/high/xhigh/max plus `ultra`
+automatic delegation; no none/minimal. The account-selection policy still
+applies: `route="astra"` retains the active account, while
+`openai_account="aether"` or the managed `astra-aether` route selects Aether.
 
 **Prefer a `pi-*` route for a wide fan-out whose provider supports pi.** The
 same 25-agent graph — 20 parallel research steps, 4 analyses, 1 report — run
@@ -110,7 +120,7 @@ entry. Account selection is passed to both quota preflight and headless-agent;
 quota caches and journal step keys distinguish accounts. A named account with
 unknown quota or invalid configuration is blocked. Combined quota cannot pass
 preflight. No built-in fallback selects an additional account automatically.
-The managed `sol-aether`, `terra-aether`, and `luna-aether` routes are explicit
+The managed `astra-aether`, `sol-aether`, `terra-aether`, and `luna-aether` routes are explicit
 choices supplied by dev-environment. Other harness/provider pairs reject
 `openai_account`.
 

@@ -54,6 +54,7 @@ DEFAULT_ROUTES = {
     "luna":     {"harness": "codex",       "provider": "openai",    "model": "gpt-5.6-luna",               "effort": "high", "posture": "review", "max_concurrency": 3, "quota": "openai",   "fallback": [],                 "timeout": 1800},
     "terra":    {"harness": "codex",       "provider": "openai",    "model": "gpt-5.6-terra",              "effort": "high", "posture": "review", "max_concurrency": 2, "quota": "openai",   "fallback": [],                 "timeout": 2400},
     "sol":      {"harness": "codex",       "provider": "openai",    "model": "gpt-5.6-sol",                "effort": "high", "posture": "review", "max_concurrency": 2, "quota": "openai",   "fallback": [],                 "timeout": 2400},
+    "astra":    {"harness": "codex", "provider": "openai", "model": "gpt-6-astra", "effort": "medium", "posture": "review", "max_concurrency": 1, "quota": "openai", "fallback": [], "format": "json", "timeout": 2400},
     # pi routes: the same providers through a minimal harness. Pi has no MCP,
     # no subagents and no permission prompts, so its system prompt is ~1.3k
     # tokens against Claude Code's or Codex's much larger one, and it reaches
@@ -240,6 +241,8 @@ class AgentResult:
         self.prompt = kw.get("prompt")
         self.cached = kw.get("cached", False)
         self.openai_account = kw.get("openai_account")
+        self.model = kw.get("model")
+        self.effort = kw.get("effort")
 
     def __bool__(self):
         return bool(self.ok)
@@ -255,7 +258,7 @@ class AgentResult:
         return default
 
     def to_dict(self):
-        return {k: getattr(self, k) for k in ("ok", "text", "data", "session_id", "run_dir", "route", "label", "key", "forked", "attempts", "error", "prompt", "cached", "openai_account")}
+        return {k: getattr(self, k) for k in ("ok", "text", "data", "session_id", "run_dir", "route", "label", "key", "forked", "attempts", "error", "prompt", "cached", "openai_account", "model", "effort")}
 
     @classmethod
     def from_dict(cls, d):
@@ -365,6 +368,11 @@ class Workflow:
         if not isinstance(parent, AgentResult) or not parent.session_id:
             raise WorkflowError("fork() needs a completed AgentResult with a session_id")
         route_name = opts.pop("route", parent.route)
+        if route_name == parent.route:
+            if parent.model and "model" not in opts:
+                opts["model"] = parent.model
+            if parent.effort and opts.get("model") == parent.model and "effort" not in opts:
+                opts["effort"] = parent.effort
         if route_name == parent.route and "openai_account" not in opts and parent.openai_account and "/" not in parent.openai_account:
             opts["openai_account"] = parent.openai_account
         route = self._resolve_route(route_name, opts)
@@ -515,7 +523,8 @@ class Workflow:
                 msg = err or f"exit {code}: {(text or '')[:300]}"
                 return AgentResult(ok=False, error=msg, route=rlabel, label=label, attempts=attempts, session_id=session_id, run_dir=run_dir, text=text), msg
             last = AgentResult(ok=True, text=text, session_id=session_id, run_dir=run_dir, route=rlabel, label=label,
-                               attempts=attempts, forked=bool(fork_from), openai_account=account_scope(spec))
+                               attempts=attempts, forked=bool(fork_from), openai_account=account_scope(spec),
+                               model=spec.get("model"), effort=spec.get("effort"))
             if schema is None:
                 return last, None
             data = extract_json(text)
