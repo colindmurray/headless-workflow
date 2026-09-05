@@ -127,6 +127,12 @@ def route_supports_fork(route):
     return route.get("harness") in FORK_HARNESSES
 
 
+def account_scope(spec):
+    if spec.get("harness") != "codex" or spec.get("provider") != "openai":
+        return None
+    return spec.get("openai_account") or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
 # --------------------------------------------------------------------------
 # JSON extraction and a small schema validator
 # --------------------------------------------------------------------------
@@ -233,6 +239,7 @@ class AgentResult:
         self.error = kw.get("error")
         self.prompt = kw.get("prompt")
         self.cached = kw.get("cached", False)
+        self.openai_account = kw.get("openai_account")
 
     def __bool__(self):
         return bool(self.ok)
@@ -248,7 +255,7 @@ class AgentResult:
         return default
 
     def to_dict(self):
-        return {k: getattr(self, k) for k in ("ok", "text", "data", "session_id", "run_dir", "route", "label", "key", "forked", "attempts", "error", "prompt", "cached")}
+        return {k: getattr(self, k) for k in ("ok", "text", "data", "session_id", "run_dir", "route", "label", "key", "forked", "attempts", "error", "prompt", "cached", "openai_account")}
 
     @classmethod
     def from_dict(cls, d):
@@ -358,8 +365,10 @@ class Workflow:
         if not isinstance(parent, AgentResult) or not parent.session_id:
             raise WorkflowError("fork() needs a completed AgentResult with a session_id")
         route_name = opts.pop("route", parent.route)
+        if route_name == parent.route and "openai_account" not in opts and parent.openai_account and "/" not in parent.openai_account:
+            opts["openai_account"] = parent.openai_account
         route = self._resolve_route(route_name, opts)
-        if route_supports_fork(route) and parent.route == route_name:
+        if route_supports_fork(route) and parent.route == route_name and parent.openai_account == account_scope(route):
             return await self.agent(prompt, route=route_name, fork_from=parent, **opts)
         ctx = textwrap.dedent(f"""
         CONTEXT FROM A PREVIOUS AGENT (session {parent.session_id}, route {parent.route}); treat it as already-established background:
@@ -375,12 +384,16 @@ class Workflow:
         return res
 
     async def agent(self, prompt, route="glm", schema=None, label=None, dir=None, posture=None, effort=None,
-                    model=None, fallback=None, retries=2, timeout=None, fork_from=None, resume=None, files=None, add_dirs=None):
+                    model=None, fallback=None, retries=2, timeout=None, fork_from=None, resume=None, files=None, add_dirs=None, openai_account=None):
         """Dispatch one headless worker and wait for its answer."""
-        overrides = {k: v for k, v in {"dir": dir, "posture": posture, "effort": effort, "model": model, "timeout": timeout, "files": files, "add_dirs": add_dirs}.items() if v is not None}
+        overrides = {k: v for k, v in {"dir": dir, "posture": posture, "effort": effort, "model": model, "timeout": timeout, "files": files, "add_dirs": add_dirs, "openai_account": openai_account}.items() if v is not None}
         route_name = route if isinstance(route, str) else "custom:" + hashlib.sha1(json.dumps(route, sort_keys=True).encode()).hexdigest()[:8]
         parent = fork_from.session_id if fork_from else (resume or None)
-        key = step_key("agent", prompt, route_name, overrides, schema, parent)
+        initial_spec = self._resolve_route(route, overrides)
+        if fork_from and fork_from.openai_account != account_scope(initial_spec):
+            raise WorkflowError("native fork requires the parent's OpenAI account")
+        cache_overrides = dict(overrides, account_scope=account_scope(initial_spec))
+        key = step_key("agent", prompt, route_name, cache_overrides, schema, parent)
         self.step_counter += 1
         label = label or f"step-{self.step_counter}"
         cached = self.journal.cache.get(key)
@@ -398,6 +411,9 @@ class Workflow:
         for rname in attempt_routes:
             spec = self._resolve_route(rname, overrides)
             rlabel = rname if isinstance(rname, str) else route_name
+            if (fork_from or resume) and account_scope(spec) != account_scope(initial_spec):
+                last_error = f"route {rlabel} uses a different account from the session"
+                continue
             if fork_from and not route_supports_fork(spec):
                 last_error = f"route {rlabel} cannot fork"
                 continue
@@ -432,11 +448,13 @@ class Workflow:
             if route not in self.routes:
                 raise WorkflowError(f"unknown route '{route}'; known: {', '.join(sorted(self.routes))}")
             spec = dict(self.routes[route])
-        for k in ("posture", "effort", "model", "timeout", "dir"):
+        for k in ("posture", "effort", "model", "timeout", "dir", "openai_account"):
             if overrides.get(k) is not None:
                 spec[k] = overrides[k]
         spec["_files"] = overrides.get("files")
         spec["_add_dirs"] = overrides.get("add_dirs")
+        if spec.get("openai_account") and (spec.get("harness"), spec.get("provider")) != ("codex", "openai"):
+            raise WorkflowError("openai_account requires a codex/openai route")
         return spec
 
     @property
@@ -454,27 +472,31 @@ class Workflow:
         qid = spec.get("quota")
         if not qid:
             return True
-        if qid in self.quota_cache:
-            return self.quota_cache[qid]
+        cache_key = (qid, account_scope(spec), spec.get("model"))
+        if cache_key in self.quota_cache:
+            return self.quota_cache[cache_key]
         script = find_quota_script()
         if not script:
-            self.quota_cache[qid] = True
-            return True
+            return not bool(spec.get("openai_account"))
+        cmd = [sys.executable, script, "--provider", qid, "--format", "json", "--preflight", "--task-size", "small"]
+        if spec.get("model"):
+            cmd += ["--model", spec["model"]]
+        if spec.get("openai_account"):
+            cmd += ["--openai-account", spec["openai_account"], "--strict-unknown"]
         try:
-            proc = subprocess.run([sys.executable, script, "--provider", qid, "--format", "json", "--preflight", "--task-size", "small"],
+            proc = subprocess.run(cmd,
                                   capture_output=True, text=True, timeout=120)
             code = proc.returncode
         except Exception as e:  # noqa: BLE001
-            self.log(f"quota preflight for {qid} errored ({e}); allowing")
-            self.quota_cache[qid] = True
-            return True
+            self.log(f"quota preflight for {cache_key} errored ({e})")
+            return not bool(spec.get("openai_account"))
         # 20 exhausted / 22 critically limited block; 21 unknown allows with a note
-        ok = code not in (20, 22)
+        ok = code == 0 if spec.get("openai_account") else code not in (20, 22, 23)
         if code == 21:
             self.log(f"quota for {qid} unknown; proceeding")
         elif not ok:
             self.log(f"quota preflight blocks {qid} (exit {code})")
-        self.quota_cache[qid] = ok
+        self.quota_cache[cache_key] = ok
         return ok
 
     async def _run_with_repair(self, prompt, spec, rlabel, label, schema, retries, fork_from, resume, key):
@@ -493,7 +515,7 @@ class Workflow:
                 msg = err or f"exit {code}: {(text or '')[:300]}"
                 return AgentResult(ok=False, error=msg, route=rlabel, label=label, attempts=attempts, session_id=session_id, run_dir=run_dir, text=text), msg
             last = AgentResult(ok=True, text=text, session_id=session_id, run_dir=run_dir, route=rlabel, label=label,
-                               attempts=attempts, forked=bool(fork_from))
+                               attempts=attempts, forked=bool(fork_from), openai_account=account_scope(spec))
             if schema is None:
                 return last, None
             data = extract_json(text)
@@ -524,6 +546,8 @@ class Workflow:
                "--prompt-file", prompt_path, "--label", label[:80], "--wait"]
         if spec.get("effort"):
             cmd += ["--effort", spec["effort"]]
+        if spec.get("openai_account"):
+            cmd += ["--openai-account", spec["openai_account"]]
         if spec.get("harness") == "agy" and spec.get("timeout"):
             cmd += ["--timeout", f"{int(spec['timeout'])}s"]
         if spec.get("harness") == "pi" and spec.get("context"):
@@ -722,7 +746,7 @@ def cmd_list(ns):
 def cmd_routes(ns):
     routes = load_routes(ns.routes)
     for name, spec in routes.items():
-        print(f"{name:9} {spec['harness']}/{spec['provider']}/{spec['model']} effort={spec.get('effort')} posture={spec.get('posture')} max={spec.get('max_concurrency')} fallback={spec.get('fallback')} fork={'yes' if route_supports_fork(spec) else 'no'}")
+        print(f"{name:9} {spec['harness']}/{spec['provider']}/{spec['model']} effort={spec.get('effort')} posture={spec.get('posture')} max={spec.get('max_concurrency')} fallback={spec.get('fallback')} fork={'yes' if route_supports_fork(spec) else 'no'} account={account_scope(spec) or '-'}")
     return 0
 
 
