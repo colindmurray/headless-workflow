@@ -303,6 +303,8 @@ class Journal:
                         e = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if not isinstance(e, dict):
+                        continue
                     if e.get("type") == "completed" and e.get("key"):
                         self.cache[e["key"]] = e["result"]
                     if e.get("key"):
