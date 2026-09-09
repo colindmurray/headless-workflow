@@ -132,6 +132,62 @@ class TestRunBasics(unittest.TestCase):
         self.assertIn("finished", proc.stdout.lower())
 
 
+class TestMalformedJournalStatus(unittest.TestCase):
+    """status must render typed corrupt/incomplete diagnostics for malformed
+    journal rows instead of crashing, without touching journal state."""
+
+    def setUp(self):
+        self.h = Harness()
+
+    def make_run(self, run_id, lines):
+        run_dir = pathlib.Path(self.h.state) / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text(json.dumps({"status": "completed"}))
+        journal = run_dir / "journal.jsonl"
+        journal.write_text("".join(lines))
+        return journal
+
+    def test_non_mapping_row_renders_corrupt_diagnostic(self):
+        journal = self.make_run("r", ["[1, 2]\n"])
+        before = journal.read_bytes()
+        proc = self.h.run("status", "r")
+        self.assertIn("corrupt", proc.stdout)
+        self.assertIn("line 1", proc.stdout)
+        self.assertEqual(journal.read_bytes(), before, "status must not mutate the journal")
+
+    def test_completed_row_with_non_mapping_result_renders_incomplete(self):
+        journal = self.make_run("r", ['{"type": "completed", "key": "k", "label": "k", "result": [1]}\n'])
+        before = journal.read_bytes()
+        proc = self.h.run("status", "r")
+        self.assertIn("incomplete", proc.stdout)
+        self.assertIn("k", proc.stdout)
+        self.assertEqual(journal.read_bytes(), before, "status must not mutate the journal")
+
+    def test_phase_row_without_title_renders_corrupt_diagnostic(self):
+        journal = self.make_run("r", ['{"type": "phase"}\n'])
+        proc = self.h.run("status", "r")
+        self.assertIn("corrupt", proc.stdout)
+
+    def test_valid_rows_still_render_around_malformed_rows(self):
+        journal = self.make_run("r", [
+            '{"type": "phase", "title": "build"}\n',
+            "[1, 2]\n",
+            '{"type": "started", "key": "a", "label": "alpha"}\n',
+            '{"type": "completed", "key": "k", "label": "k", "result": [1]}\n',
+            '{"type": "completed", "key": "b", "label": "beta", "result": {"route": "glm", "session_id": "sess-9", "attempts": 2}}\n',
+            '{"type": "failed", "key": "c", "label": "gamma", "error": "boom"}\n',
+        ])
+        before = journal.read_bytes()
+        proc = self.h.run("status", "r")
+        self.assertIn("== build", proc.stdout)
+        self.assertIn("alpha", proc.stdout)
+        self.assertIn("route=glm session=sess-9 attempts=2", proc.stdout)
+        self.assertIn("error=boom", proc.stdout)
+        self.assertIn("corrupt", proc.stdout)
+        self.assertIn("incomplete", proc.stdout)
+        self.assertEqual(journal.read_bytes(), before, "status must not mutate the journal")
+
+
 class TestSchemaAndRepair(unittest.TestCase):
     def setUp(self):
         self.h = Harness()

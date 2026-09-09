@@ -924,19 +924,29 @@ def cmd_status(ns):
         print(f"error: {meta['error']}")
     phase = None
     with open(j.path) as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, 1):
             try:
                 e = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(e, dict):
+                print(f"  [{'corrupt':9}] journal line {lineno}: non-mapping record ignored")
+                continue
             if e.get("type") == "phase":
-                phase = e["title"]
+                title = e.get("title")
+                if not isinstance(title, str):
+                    print(f"  [{'corrupt':9}] journal line {lineno}: phase record without title ignored")
+                    continue
+                phase = title
                 print(f"== {phase}")
             elif e.get("type") in ("started", "completed", "failed"):
                 state = e["type"]
                 extra = ""
                 if state == "completed":
-                    r = e.get("result") or {}
+                    r = e.get("result")
+                    if not isinstance(r, dict):
+                        print(f"  [{'incomplete':9}] {e.get('label')} (completed record without mapping result ignored)")
+                        continue
                     extra = f" route={r.get('route')} session={r.get('session_id')} attempts={r.get('attempts')}"
                 elif state == "failed":
                     extra = f" error={e.get('error')}"
