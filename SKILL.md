@@ -1,6 +1,6 @@
 ---
 name: headless-workflow
-description: Use when one task needs many headless-agent workers at once — a fan-out over files, issues, or lanes, a digest→judge→verify→synthesize pass, forked children sharing one parent's context, or a swarm mixing providers — and the caller (Codex, Claude Code, or a shell) must wait cheaply and resume after a crash instead of babysitting each run.
+description: Orchestrate a resumable graph of headless workers with bounded concurrency and cached steps. Use when a task needs multiple dependent or parallel workers and durable orchestration beyond one headless-agent run.
 ---
 
 # Headless workflow
@@ -17,6 +17,8 @@ Derive `SKILL_DIR` from this loaded skill; `HW="$SKILL_DIR/scripts/headless-work
 ## Write the script
 
 ```python
+import json
+
 META = {"name": "review-batch", "description": "digest then judge"}
 SCHEMA = {"type": "object", "required": ["findings"]}
 
@@ -26,7 +28,7 @@ async def main(wf, args):
         (lambda f=f: wf.agent(f"Digest {f} as JSON.", route="gemini", schema=SCHEMA, label=f"digest:{f}"))
         for f in args["files"]])
     wf.phase("judge")
-    ctx = await wf.agent("Read every digest under ./digests; reply READY.", route="glm", label="context")
+    ctx = await wf.agent("Retain these digests for review: " + json.dumps([d.data for d in digests if d]), route="glm", label="context")
     verdicts = await wf.parallel([
         (lambda f=f: wf.fork(ctx, f"Judge only {f}; return JSON findings.", schema=SCHEMA)) for f in args["files"]])
     return {"digests": [d.data for d in digests if d], "verdicts": [v.data for v in verdicts if v]}
@@ -53,9 +55,9 @@ python3 "$HW" run review.py --resume <RUN_ID>   # unchanged steps come back cach
 ```
 
 The run prints `RUN_ID`, `RUN_DIR`, and `LOG` first, then blocks until
-`main()` returns. From Codex, start it as a background cell and make ONE
-`write_stdin(chars:"", yield_time_ms: <expected minutes × 60000>)`; the
-`sleep-and-wait` rule applies. From Claude Code, run it with
+`main()` returns. From Codex, start it as a background cell and wait on that same process with the harness's bounded wait facility.
+Use the longest permitted wait, keeping required progress updates responsive;
+do not relaunch work just because a tool yielded. From Claude Code, run it with
 `run_in_background: true`.
 
 ## Routes
@@ -84,33 +86,10 @@ automatic delegation; no none/minimal. The account-selection policy still
 applies: `route="astra"` retains the active account, while
 `openai_account="aether"` or the managed `astra-aether` route selects Aether.
 
-**Prefer a `pi-*` route for a wide fan-out whose provider supports pi.** The
-same 25-agent graph — 20 parallel research steps, 4 analyses, 1 report — run
-twice on `gpt-5.6-luna` at low effort, once through `codex` and once through
-`pi` at `context: lean`:
-
-| | codex | pi (lean) |
-| --- | --- | --- |
-| Prompt tokens, mean per worker | 34,610 | 1,528 |
-| Prompt tokens, total | 865,250 | 39,728 |
-| Total tokens | 871,893 | 42,313 |
-| Median step | 42.0s | 11.5s |
-| Wall clock | 132s | 70s |
-| Steps at exit 0 | 25/25 | 26/26 |
-
-Both produced 20 digests, 4 analyses, and a report of the same length reaching
-the same recommendation — a 20x token saving and a 1.9x speedup at equal output.
-
-The saving comes from `context: lean`, not from pi itself. Codex loads the whole
-skill tree into every worker and cannot be told not to; it even warns that it
-truncated skill descriptions to fit. Pi at `context: standard` costs 16,450
-tokens against codex's 19,065, only 14% better. So the recommendation is
-specifically **pi plus lean context**, and raising a pi route to `standard`
-gives most of the advantage back.
-
-Stay on the non-pi routes when a step needs MCP tools, sub-delegation, a richer
-built-in toolset — pi has only `read`, `bash`, `edit`, `write`, `grep`, `find`,
-`ls` — or a skill actually loaded into the worker.
+Use a lean `pi-*` route when its limited toolset meets the task. Steps needing
+MCP, delegation, or discovered skills may need another harness. Read
+[context-cost](references/context-cost.md) for the measured comparison and
+its limits; the small benchmark is not a guarantee for other tasks.
 
 ## Fork and structured output
 
