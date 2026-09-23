@@ -243,8 +243,10 @@ class TestFatalAndLifecycle(Base):
         t0 = time.time()
         self.assertEqual(m._communicate(proc, 0.5), (None, None))
         self.assertLess(time.time() - t0, 10)
-        with self.assertRaises(ProcessLookupError):
-            os.killpg(proc.pid, 0)
+        deadline = time.time() + 8  # killed members may linger briefly as zombies until init reaps them
+        while time.time() < deadline and m._group_alive(proc.pid):
+            time.sleep(0.1)
+        self.assertFalse(m._group_alive(proc.pid))
 
     def test_provider_error_shapes(self):
         from test_headless_workflow import load_module
