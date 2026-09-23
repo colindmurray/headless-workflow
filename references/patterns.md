@@ -1,6 +1,21 @@
 # headless-workflow — patterns
 
-Shapes that have paid off. Each is a complete `main()`; combine freely.
+Shapes that have paid off; combine freely. Each is a `main()` that assumes a
+`META` and these schemas. Without them, the NameError is swallowed inside
+`parallel`, and the run "succeeds" with empty results:
+
+```python
+META = {"name": "pattern", "description": "one line"}
+ANSWER = {"type": "object", "required": ["answer"]}
+BUGS = {"type": "object", "required": ["bugs"], "properties": {"bugs": {"type": "array"}}}
+VERDICT = {"type": "object", "required": ["refuted", "reasoning"], "properties": {"refuted": {"type": "boolean"}}}
+REVIEW = {"type": "object", "required": ["verdict", "findings"]}
+```
+
+When several workers need the same large context, start with
+[explore once, fork many](fork-fanout.md). It is the largest token saving
+available, and it combines with every shape below: fork the finders, judges or
+reviewers from one explorer instead of giving each of them the material fresh.
 
 ## Digest → judge → verify → synthesize
 
@@ -25,6 +40,8 @@ async def main(wf, args):
     wf.phase("judge")
     judge = await wf.agent(f"Digests: {[d.data for d in digests if d]}\nReturn findings as JSON.",
                            route="opus", schema=FINDINGS, label="judge")
+    if not judge:
+        return {"error": judge.error}
     wf.phase("verify")
     checked = await wf.pipeline(
         judge.data["findings"],
@@ -39,24 +56,9 @@ async def main(wf, args):
 
 ## Shared-context fork fan-out
 
-One worker builds the expensive context once; every child is a native fork,
-so children start with the parent's history and the provider's cached
-prefix instead of re-reading. Use a fork-capable route (`glm`, `sonnet`,
-`opus`, `luna`, or `opencode` models).
-
-```python
-async def main(wf, args):
-    parent = await wf.agent(f"Read {args['spec']} and the modules it names. Reply DONE when you hold the full picture.",
-                            route="glm", label="context")
-    kids = await wf.parallel([
-        (lambda q=q: wf.fork(parent, f"Using what you read, answer only this: {q}", schema=ANSWER, label=q[:30]))
-        for q in args["questions"]])
-    return [k.data for k in kids if k]
-```
-
-If the route cannot fork, `fork()` still works by prepending the parent's
-prompt and answer; keep the parent's answer compact when that fallback is
-likely.
+Moved to [fork-fanout.md](fork-fanout.md), with the rules that make the cache
+hit, explorer sizing, sharding, and when not to fork. The runnable recipe is
+`examples/fork-fanout.py`.
 
 ## Loop until dry
 
@@ -104,8 +106,8 @@ async def main(wf, args):
     return [{"key": iss["key"], "review": (o.data if o else None)} for iss, o in zip(args["issues"], outs)]
 ```
 
-Give every writer its own `dir`; never two `posture="code"` agents in one
-worktree. Keep tracker claims and merges with the supervisor.
+Give every writer its own `dir` (or `isolation="worktree"`); never two
+`posture="code"` agents in one worktree. Keep tracker claims and merges with the supervisor.
 
 ## Verify with independent lenses
 

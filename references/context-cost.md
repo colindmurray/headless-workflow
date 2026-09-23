@@ -28,3 +28,8 @@ Stay on the non-pi routes when a step needs MCP tools, sub-delegation, a richer
 built-in toolset — pi has only `read`, `bash`, `edit`, `write`, `grep`, `find`,
 `ls` — or a skill actually loaded into the worker.
 
+
+The other large lever is not to repeat context at all: when several workers
+need the same material, fork them from one explorer so they read it from the
+provider's prompt cache. That saving stacks with this one on `pi-*` routes,
+which can fork. See [fork-fanout](fork-fanout.md).
