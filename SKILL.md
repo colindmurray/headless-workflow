@@ -8,17 +8,42 @@ description: Orchestrate a resumable graph of headless workers with bounded conc
 One Python process orchestrates a swarm of `headless-agent` workers from a
 short workflow script, journals every step, and lets the caller wait with a
 single long tool call. It mirrors Claude Code's Workflow tool (`agent`,
-`parallel`, `pipeline`) and adds `fork`, route fallback, structured-output
-repair, and per-route concurrency, so a Codex supervisor can knock out dozens
-of bounded tasks per wave without spending its own turns.
+`parallel`, `pipeline`, `phase`, `log`, `workflow`, `isolation="worktree"`,
+resume from cache) across every headless provider. It adds native `fork`,
+route fallback, structured-output repair and per-route concurrency, so a Codex
+or Claude supervisor can finish dozens of bounded tasks per wave without
+spending its own turns.
 
 Derive `SKILL_DIR` from this loaded skill; `HW="$SKILL_DIR/scripts/headless-workflow.py"`.
+
+## Explore once, fork many
+
+When several workers need the same large context (one diff, spec or module
+set), do not give each worker that context fresh. Have **one explorer read it,
+then fork every worker from the explorer's session**. Each fork starts with the
+explorer's full history and reads it from the provider's prompt cache at about
+0.1× input price. A 15-dimension review of a large PR then pays for reading the
+PR once, not 15 times, and every reviewer skips straight to its own work.
+
+```python
+explorer = await wf.agent(f"Read {target} and the code it touches. Do not review. Reply with a file map.",
+                          route="sonnet", dir=root, fallback=[], label="explore")
+reviews = await wf.parallel([
+    (lambda d=d: wf.fork(explorer, f"Review only for {d}. JSON findings.", schema=FINDINGS,
+                         require_native=True, label=f"review:{d}"))
+    for d in dimensions])
+```
+
+Before writing one, read [fork-fanout](references/fork-fanout.md). It covers
+the cache rules (a fork keeps the parent's route, model, effort, dir and
+posture; do not override them), explorer sizing and sharding for changes
+bigger than one context window, provider economics, when not to fork, and how
+to confirm cache hits. `examples/fork-fanout.py` is the full
+explore → review → verify → synthesize recipe.
 
 ## Write the script
 
 ```python
-import json
-
 META = {"name": "review-batch", "description": "digest then judge"}
 SCHEMA = {"type": "object", "required": ["findings"]}
 
@@ -27,23 +52,33 @@ async def main(wf, args):
     digests = await wf.parallel([
         (lambda f=f: wf.agent(f"Digest {f} as JSON.", route="gemini", schema=SCHEMA, label=f"digest:{f}"))
         for f in args["files"]])
-    wf.phase("judge")
-    ctx = await wf.agent("Retain these digests for review: " + json.dumps([d.data for d in digests if d]), route="glm", label="context")
-    verdicts = await wf.parallel([
-        (lambda f=f: wf.fork(ctx, f"Judge only {f}; return JSON findings.", schema=SCHEMA)) for f in args["files"]])
-    return {"digests": [d.data for d in digests if d], "verdicts": [v.data for v in verdicts if v]}
+    verdicts = await wf.pipeline(
+        [d for d in digests if d],
+        lambda d, i: wf.agent(f"Judge this digest; JSON findings: {d.data}", route="glm", schema=SCHEMA, phase="judge"))
+    return {"verdicts": [v.data for v in verdicts if v]}
 ```
 
 `args` is the parsed JSON from `--args` (or `None`). `wf.agent()` returns an
 `AgentResult`: `.ok`, `.text`, `.data` (parsed JSON when `schema` is given),
 `.session_id`, `.route`, `.attempts`, `.error`; `r["k"]` and `r.get("k")`
-read from `.data`. A failed step is falsy, never an exception, so filter
-results the way Claude's `.filter(Boolean)` does. `wf.parallel` takes
-zero-argument callables (the `lambda x=x:` form binds loop variables), not
-bare coroutines; `wf.pipeline(items, s1, s2)` calls `s1(item, i)` then
-`s2(prev, item, i)` per item with no barrier. Step keys derive from prompt +
-route + parent, so keep scripts deterministic: no clocks, no randomness, and
-variable inputs only through `--args`.
+read from `.data`. A failed step is falsy rather than an exception, so filter
+results the way Claude's `.filter(Boolean)` does. Only `WorkflowError` is
+fatal: an unknown route, the `--max-agents` cap, or a misconfigured step such
+as `isolation` outside a git checkout. It fails the run even inside
+`parallel`/`pipeline`.
+
+- `wf.parallel` takes zero-argument callables (bind loop variables with
+  `lambda x=x:`) or awaitables. Unlike the built-in, `wf.pipeline(items, s1, s2)`
+  calls the first stage as `s1(item, i)`, then later stages as
+  `s2(prev, item, i)`, with no barrier; a stage returning `None` drops the item.
+- Inside `pipeline`/`parallel`, pass `phase=` per call rather than calling
+  `wf.phase()`, which is global.
+- `isolation="worktree"` runs one writer in a fresh git worktree of `dir`.
+  `await wf.workflow("other.py", args)` runs another script inline, one level
+  deep.
+- Keep scripts deterministic: no clocks, no randomness, and variable inputs
+  only through `--args`. Identical calls are fine, because the nth identical
+  call has its own journal entry.
 
 ## Run and wait
 
@@ -51,7 +86,7 @@ variable inputs only through `--args`.
 python3 "$HW" run review.py --args '{"files": ["a.md", "b.md"]}' --concurrency 8
 python3 "$HW" status <RUN_ID>          # steps, states, routes, sessions
 python3 "$HW" result <RUN_ID>          # the JSON main() returned
-python3 "$HW" run review.py --resume <RUN_ID>   # unchanged steps come back cached
+python3 "$HW" run review.py --resume <RUN_ID>   # same args; unchanged steps come back cached
 ```
 
 The run prints `RUN_ID`, `RUN_DIR`, and `LOG` first, then blocks until
@@ -68,7 +103,7 @@ do not relaunch work just because a tool yielded. From Claude Code, run it with
 `pi-glm`, `pi-muse`, `pi-sol` (the
 same providers through the minimal `pi` harness). Each carries harness/provider/model,
 effort, posture, `max_concurrency`, a quota id for the `check-ai-quota`
-preflight (exit 20/22 skips the route), and a `fallback` list tried in order
+preflight (exit 20, 22 or 23 skips the route), and a `fallback` list tried in order
 when a dispatch fails. Add `"format": "json"` to any route when you need to
 account for its token spend afterwards: without it a codex route runs in its
 text default, whose stream carries no structured usage. Override or add routes in
@@ -91,7 +126,7 @@ MCP, delegation, or discovered skills may need another harness. Read
 [context-cost](references/context-cost.md) for the measured comparison and
 its limits; the small benchmark is not a guarantee for other tasks.
 
-## Fork and structured output
+## Accounts, fork fallback and structured output
 
 For a named Codex/OpenAI account, pass `openai_account="aether"` to
 `wf.agent(..., route="sol")`, or put `"openai_account": "aether"` in a route
@@ -103,17 +138,20 @@ The managed `astra-aether`, `sol-aether`, `terra-aether`, and `luna-aether` rout
 choices supplied by dev-environment. Other harness/provider pairs reject
 `openai_account`.
 
-`wf.fork(parent, prompt)` continues the parent's session on fork-capable
-harnesses (`claude_code`, `codex`, `opencode`, `pi`, `prime-agent`): children share
-the parent's history and cached prefix. On other harnesses it becomes a fresh
-agent that receives the parent's prompt and answer as context, and
-`result.forked` is `False`. `schema=` forces JSON: fences and prose are
-stripped, the object is validated, and an invalid reply is repaired by
-resuming the same session (up to `retries`, default 2) before the step fails.
+`wf.fork()` is native on `claude_code`, `codex`, `opencode`, `pi` and
+`prime-agent` routes. A fork or `resume=` step never falls back to another
+route, because another provider or model cannot continue the session or share
+its cache. It retries its own route once after a failure instead. If a native
+fork is impossible (a non-fork route, or a route other than the parent's),
+`fork()` sends a fresh agent the parent's prompt and final answer as context,
+with `forked=False`; pass `require_native=True` to fail instead. A failed or
+session-less parent returns a failed result. `schema=` forces JSON: fences and
+prose are stripped, the object is validated, and an invalid reply is repaired
+by resuming the same session (up to `retries`, default 2) before the step fails.
 
-Full API, journal layout, and route fields: `references/api.md`. Proven
-shapes (digest→judge→verify→synthesize, shared-context fork fan-out,
-loop-until-dry, issue swarms): `references/patterns.md`.
+Full API, journal layout, route fields and built-in parity: `references/api.md`.
+Proven shapes (digest→judge→verify→synthesize, loop-until-dry, issue swarms,
+independent-lens verification): `references/patterns.md`.
 
 ## Test
 

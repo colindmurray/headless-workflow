@@ -14,16 +14,18 @@ Usage:
 
 A workflow script defines META = {"name": ..., "description": ...} and
 `async def main(wf, args)`; `wf` exposes agent(), fork(), parallel(),
-pipeline(), log(), phase(). See references/api.md.
+pipeline(), workflow(), log(), phase(). See references/api.md.
 
 Stdlib only; Python 3.9+.
 """
 import argparse
 import asyncio
+import contextvars
 import copy
 import datetime as dt
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -33,7 +35,10 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 # --------------------------------------------------------------------------
 # Locations and defaults
@@ -71,7 +76,21 @@ DEFAULT_ROUTES = {
 }
 
 FORK_HARNESSES = {"claude_code", "codex", "opencode", "pi", "prime-agent"}
-RETRYABLE_PATTERNS = ("429", "rate limit", "Rate limit", "overloaded", "503", "502", "timed out", "timeout", "401", "token expired", "quota", "exhausted", "no output produced", "no response content")
+# A short exit-0 reply counts as a provider error only in a known provider
+# shape. Bare words ("timeout", "quota", "Error:", a number) are ordinary
+# answers far more often than they are outages.
+PROVIDER_ERROR_RE = re.compile(
+    r"^\s*\[?(api error\b|request (failed|rejected)\b|rate limit(ed)? (exceeded|reached)|too many requests"
+    r"|(usage|quota) (limit )?(exceeded|exhausted|reached)|token expired|no output produced|no response content)"
+    r"|\b(overloaded_error|rate_limit_error|insufficient_quota|resource_exhausted)\b"
+    r"|^\s*\[?(4\d\d|5\d\d)\b.{0,40}\b(too many requests|service unavailable|bad gateway|gateway timeout|overloaded|unauthori[sz]ed|forbidden|internal server error)",
+    re.I)
+# A fork or resume step never falls back: another route (even on the same
+# harness) is another provider or model, which cannot share the session's
+# cache and may not replay its transcript. It retries its own route once
+# after this pause instead.
+SESSION_RETRY_DELAY = float(os.environ.get("HEADLESS_WORKFLOW_SESSION_RETRY_DELAY", "20"))
+_WORKFLOW_DEPTH = contextvars.ContextVar("headless_workflow_depth", default=0)
 
 
 def now_iso():
@@ -138,8 +157,10 @@ def account_scope(spec):
 # JSON extraction and a small schema validator
 # --------------------------------------------------------------------------
 
-def extract_json(text):
-    """Return the first JSON object/array found in text, or None."""
+def extract_json(text, schema=None):
+    """Return the first JSON object/array found in text, or None. With a
+    schema, prefer the first candidate that validates, so a stray "[12, 40]"
+    in prose before the real object does not cost a repair round."""
     if text is None:
         return None
     t = text.strip()
@@ -147,15 +168,19 @@ def extract_json(text):
     candidates = [m.group(1)] if m else []
     candidates.append(t)
     dec = json.JSONDecoder()
+    first = None
     for cand in candidates:
         for i, ch in enumerate(cand):
             if ch in "{[":
                 try:
                     obj, _ = dec.raw_decode(cand[i:])
-                    return obj
                 except json.JSONDecodeError:
                     continue
-    return None
+                if schema is None or validate_schema(obj, schema) is None:
+                    return obj
+                if first is None:
+                    first = obj
+    return first
 
 
 _TYPES = {"object": dict, "array": list, "string": str, "integer": int, "number": (int, float), "boolean": bool, "null": type(None)}
@@ -267,6 +292,15 @@ class AgentResult:
         self.neighbors = kw.get("neighbors")
         self.evidence_digest = kw.get("evidence_digest")
         self.input_identity = kw.get("input_identity")
+        # where the session lives: a fork must run on the same harness, in the
+        # same directory, with the same posture to find it and reuse its cache
+        self.harness = kw.get("harness")
+        self.provider = kw.get("provider")
+        self.dir = kw.get("dir")
+        self.posture = kw.get("posture")
+        self.add_dirs = kw.get("add_dirs")
+        self.route_spec = kw.get("route_spec")
+        self.worktree = kw.get("worktree")
 
     def __bool__(self):
         return bool(self.ok)
@@ -283,11 +317,80 @@ class AgentResult:
 
     def to_dict(self):
         return {k: getattr(self, k) for k in ("ok", "text", "data", "session_id", "run_dir", "route", "label", "key", "forked", "attempts", "error", "prompt", "cached", "openai_account", "model", "effort",
-                                              "cell", "neighbors", "evidence_digest", "input_identity")}
+                                              "cell", "neighbors", "evidence_digest", "input_identity",
+                                              "harness", "provider", "dir", "posture", "add_dirs", "route_spec", "worktree")}
 
     @classmethod
     def from_dict(cls, d):
         return cls(**d)
+
+
+def route_label(route):
+    """Journal name of a route: its table name, or a stable hash of a dict."""
+    if isinstance(route, str):
+        return route
+    return "custom:" + hashlib.sha1(json.dumps(route, sort_keys=True).encode()).hexdigest()[:8]
+
+
+def _group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _kill_group(proc, grace=5.0):
+    """SIGTERM the worker's process group; SIGKILL whatever of the group is
+    still alive after `grace` seconds (not just the leader, which bash
+    wrappers make exit at once)."""
+    pgid = proc.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+
+    def reap():
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline and _group_alive(pgid):
+            time.sleep(0.1)
+        if _group_alive(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
+    threading.Thread(target=reap, daemon=True).start()
+
+
+def _communicate(proc, limit, grace=10.0):
+    """Blocking drain for an executor thread; (None, None) on timeout. After
+    the kill the drain is bounded too: a process that left the group but
+    kept the pipe open must not hold the step."""
+    try:
+        return proc.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        try:
+            proc.communicate(timeout=grace)
+        except subprocess.TimeoutExpired:
+            for fh in (proc.stdout, proc.stderr):
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+        return None, None
+
+
+async def _call(fn, *a):
+    """Run a thunk or stage that may be sync, async, or already an awaitable."""
+    v = fn(*a) if callable(fn) else fn
+    if inspect.isawaitable(v):
+        v = await v
+    return v
 
 
 def valid_cache_key(key):
@@ -476,11 +579,16 @@ class Workflow:
         # a Semaphore built before asyncio.run() binds to a different loop.
         self.global_concurrency = global_concurrency
         self._global_sem = None
+        # one drain thread per concurrent dispatch; quota probes use the default pool
+        self.pool = ThreadPoolExecutor(max_workers=max(1, global_concurrency), thread_name_prefix="hw-dispatch")
         self.route_sems = {}
         self.dispatched = 0
         self.phase_title = None
         self.quota_cache = {}
         self.step_counter = 0
+        self._occurrences = {}
+        self._quota_locks = {}
+        self.script_dir = None
         self.log_path = os.path.join(run_dir, "log.txt")
 
     # ----- user-facing helpers -----
@@ -497,11 +605,16 @@ class Workflow:
         self.log(f"phase: {title}")
 
     async def parallel(self, thunks):
+        """Barrier. Each element is a zero-arg callable (sync or async) or an
+        awaitable; one that raises yields None. WorkflowError (an unknown
+        route, the --max-agents cap) is fatal and fails the run."""
         async def guard(t):
             try:
-                return await t()
+                return await _call(t)
+            except WorkflowError:
+                raise
             except Exception as e:  # noqa: BLE001 - a failing thunk is a null result, never a run failure
-                self.log(f"parallel: thunk failed: {e}")
+                self.log(f"parallel: thunk failed: {e!r}")
                 return None
         return list(await asyncio.gather(*[guard(t) for t in thunks]))
 
@@ -511,34 +624,92 @@ class Workflow:
             for si, stage in enumerate(stages):
                 try:
                     if si == 0:
-                        prev = await stage(item, index)
+                        prev = await _call(stage, item, index)
                     else:
-                        prev = await stage(prev, item, index)
+                        prev = await _call(stage, prev, item, index)
+                except WorkflowError:
+                    raise
                 except Exception as e:  # noqa: BLE001
-                    self.log(f"pipeline: item {index} stage {si} failed: {e}")
+                    self.log(f"pipeline: item {index} stage {si} failed: {e!r}")
                     return None
                 if prev is None:
                     return None
             return prev
         return list(await asyncio.gather(*[chain(it, i) for i, it in enumerate(items)]))
 
-    async def fork(self, parent, prompt, **opts):
-        """Continue from a finished agent's session. Native fork on
-        fork-capable harnesses; otherwise a fresh agent that receives the
-        parent's prompt and answer as context (result.forked is False)."""
-        if not isinstance(parent, AgentResult) or not parent.session_id:
-            raise WorkflowError("fork() needs a completed AgentResult with a session_id")
-        route_name = opts.pop("route", parent.route)
-        if route_name == parent.route:
-            if parent.model and "model" not in opts:
+    async def workflow(self, script, args=None):
+        """Run another workflow script's main(wf, args) inline, sharing this
+        run's journal, caps and concurrency. One nesting level, like the
+        built-in Workflow tool."""
+        if _WORKFLOW_DEPTH.get() >= 1:
+            raise WorkflowError("workflow() nests one level only")
+        path = script if os.path.isabs(script) or not self.script_dir else os.path.join(self.script_dir, script)
+        if not os.path.exists(path):
+            raise WorkflowError(f"workflow(): no such script {script}")
+        try:
+            mod, meta = load_script(path)
+        except SystemExit as e:
+            raise WorkflowError(f"workflow(): {e}")
+        self.log(f"workflow: {meta.get('name', os.path.basename(path))}")
+        token = _WORKFLOW_DEPTH.set(1)
+        try:
+            return await mod.main(self, args)
+        finally:
+            _WORKFLOW_DEPTH.reset(token)
+
+    async def fork(self, parent, prompt, require_native=False, **opts):
+        """Branch a new session from a finished agent. Native on fork-capable
+        harnesses: the child keeps the parent's route, model, effort, dir,
+        posture and add_dirs unless overridden, so it finds the session and
+        reads the parent's cached prefix. Otherwise, with require_native
+        False, a fresh agent receives the parent's prompt and final answer as
+        context (result.forked is False); with require_native True the step
+        fails instead."""
+        label = opts.get("label")
+        if not isinstance(parent, AgentResult) or not parent.ok or not parent.session_id:
+            why = "no parent result" if not isinstance(parent, AgentResult) else (parent.error or "parent has no session_id")
+            self.log(f"{label or 'fork'}: cannot fork a failed parent ({why})")
+            return AgentResult(ok=False, error=f"fork() needs a successful parent with a session_id: {why}", label=label, prompt=prompt)
+        route = opts.pop("route", None)
+        if route is None:
+            route = parent.route_spec or parent.route
+        route_name = route_label(route)
+        same_route = route_name == parent.route
+        if same_route:
+            # model/effort only when the parent overrode the route's defaults:
+            # an inherited override would also be forced onto fallback routes
+            default = self._resolve_route(route, {})
+            if parent.model and parent.model != default.get("model") and "model" not in opts:
                 opts["model"] = parent.model
-            if parent.effort and opts.get("model") == parent.model and "effort" not in opts:
+            if (parent.effort and parent.effort != default.get("effort") and "effort" not in opts
+                    and opts.get("model", default.get("model")) == parent.model):
                 opts["effort"] = parent.effort
-        if route_name == parent.route and "openai_account" not in opts and parent.openai_account and "/" not in parent.openai_account:
-            opts["openai_account"] = parent.openai_account
-        route = self._resolve_route(route_name, opts)
-        if route_supports_fork(route) and parent.route == route_name and parent.openai_account == account_scope(route):
-            return await self.agent(prompt, route=route_name, fork_from=parent, **opts)
+            for k in ("dir", "posture", "add_dirs"):
+                if getattr(parent, k) is not None and k not in opts:
+                    opts[k] = getattr(parent, k)
+            if "openai_account" not in opts and parent.openai_account and "/" not in parent.openai_account:
+                opts["openai_account"] = parent.openai_account
+        if same_route and parent.dir and not os.path.isdir(parent.dir):
+            # e.g. an isolation="worktree" parent whose clean worktree was removed
+            return AgentResult(ok=False, error=f"cannot fork: the parent's directory {parent.dir} no longer exists", route=route_name, label=label, prompt=prompt)
+        spec = self._resolve_route(route, opts)
+        why_not = None
+        if not route_supports_fork(spec):
+            why_not = f"harness {spec.get('harness')} cannot fork"
+        elif not same_route:
+            why_not = f"route {route_name} differs from the parent's {parent.route}"
+        elif parent.harness and parent.harness != spec.get("harness"):
+            why_not = f"parent session is on {parent.harness}"
+        elif parent.openai_account != account_scope(spec):
+            why_not = "parent session belongs to another OpenAI account"
+        if why_not is None:
+            if opts.get("isolation"):
+                return AgentResult(ok=False, error="a native fork must run in the parent's directory; isolation is not allowed", route=route_name, label=label, prompt=prompt)
+            return await self.agent(prompt, route=route, fork_from=parent, **opts)
+        if require_native:
+            self.log(f"{label or 'fork'}: native fork impossible ({why_not}); require_native set, failing")
+            return AgentResult(ok=False, error=f"native fork impossible: {why_not}", route=route_name, label=label, prompt=prompt)
+        self.log(f"{label or 'fork'}: native fork impossible ({why_not}); sending the parent's prompt and answer as context instead")
         ctx = textwrap.dedent(f"""
         CONTEXT FROM A PREVIOUS AGENT (session {parent.session_id}, route {parent.route}); treat it as already-established background:
         --- previous prompt ---
@@ -548,14 +719,19 @@ class Workflow:
         --- end context ---
 
         """)
-        res = await self.agent(ctx + prompt, route=route_name, **opts)
+        res = await self.agent(ctx + prompt, route=route, **opts)
         res.forked = False
         return res
 
     async def agent(self, prompt, route="glm", schema=None, label=None, dir=None, posture=None, effort=None,
-                    model=None, fallback=None, retries=2, timeout=None, fork_from=None, resume=None, files=None, add_dirs=None, openai_account=None,
-                    success=None, cell=None, neighbors=None, evidence_digest=None, input_identity=None):
+                    model=None, fallback=None, retries=2, timeout=None, fork_from=None, resume=None, add_dirs=None, openai_account=None,
+                    success=None, cell=None, neighbors=None, evidence_digest=None, input_identity=None, phase=None, isolation=None):
         """Dispatch one headless worker and wait for its answer.
+
+        `phase` groups this step in `status` without touching the global
+        phase() state, which races inside pipeline()/parallel().
+        `isolation="worktree"` runs the worker in a fresh detached git
+        worktree of `dir` (or the cwd), removed afterwards if left unchanged.
 
         Cell-granular resume (all optional, all backwards compatible): `success`
         is a semantic success predicate over the finished AgentResult — a
@@ -569,20 +745,31 @@ class Workflow:
         redispatches only the failed or unrun cells. A cached completion
         older than the cell's latest structured failure is never served.
         """
-        overrides = {k: v for k, v in {"dir": dir, "posture": posture, "effort": effort, "model": model, "timeout": timeout, "files": files, "add_dirs": add_dirs, "openai_account": openai_account}.items() if v is not None}
-        route_name = route if isinstance(route, str) else "custom:" + hashlib.sha1(json.dumps(route, sort_keys=True).encode()).hexdigest()[:8]
-        parent = fork_from.session_id if fork_from else (resume or None)
+        if isolation not in (None, "worktree"):
+            raise WorkflowError(f"unknown isolation {isolation!r}; only 'worktree' is supported")
+        overrides = {k: v for k, v in {"dir": dir, "posture": posture, "effort": effort, "model": model, "timeout": timeout, "add_dirs": add_dirs, "openai_account": openai_account}.items() if v is not None}
+        route_name = route_label(route)
+        parent = fork_from.session_id if fork_from is not None else (resume or None)
         initial_spec = self._resolve_route(route, overrides)
-        if fork_from and fork_from.openai_account != account_scope(initial_spec):
+        if fork_from is not None and fork_from.openai_account != account_scope(initial_spec):
             raise WorkflowError("native fork requires the parent's OpenAI account")
         cache_overrides = dict(overrides, account_scope=account_scope(initial_spec))
+        if isolation:
+            cache_overrides["isolation"] = isolation
         neighbors_norm = None
         if neighbors is not None:
             neighbors_norm = sorted(neighbors, key=repr) if isinstance(neighbors, (list, tuple, set)) else neighbors
-        key = step_key("agent", prompt, route_name, cache_overrides, schema, parent, cell=cell,
-                       neighbors=neighbors_norm, evidence_digest=evidence_digest, input_identity=input_identity)
+        base_key = step_key("agent", prompt, route_name, cache_overrides, schema, parent, cell=cell,
+                            neighbors=neighbors_norm, evidence_digest=evidence_digest, input_identity=input_identity)
+        # The nth identical call gets its own key, so N identical voters or a
+        # loop re-issuing one prompt resume as N results, not one. Counted
+        # before any await, so the order is the deterministic call order.
+        occurrence = self._occurrences.get(base_key, 0)
+        self._occurrences[base_key] = occurrence + 1
+        key = base_key if occurrence == 0 else hashlib.sha256(f"{base_key}#{occurrence}".encode()).hexdigest()[:24]
         self.step_counter += 1
         label = label or f"step-{self.step_counter}"
+        phase = phase or self.phase_title
         cell_fields = {"cell": cell, "neighbors": neighbors_norm, "evidence_digest": evidence_digest, "input_identity": input_identity}
         cached = self.journal.cache.get(key)
         if cached:
@@ -595,61 +782,91 @@ class Workflow:
                 else:
                     self.log(f"cached: {label}")
                     r.cached = True
+                    r.label = label
                     return r
         if fallback is None:
-            fallback = list(self._resolve_route(route, overrides).get("fallback", [])) if isinstance(route, str) else []
-        attempt_routes = [route] + [r for r in fallback if r != route]
-        self.journal.write({"type": "started", "key": key, "label": label, "route": route_name, "phase": self.phase_title, "prompt_head": prompt[:200]})
+            fallback = list(initial_spec.get("fallback", [])) if isinstance(route, str) else []
+        session_step = fork_from is not None or bool(resume)
+        # a session continues only on the route that created it
+        attempt_routes = [route] if session_step else [route] + [r for r in fallback if r != route]
+        self.journal.write({"type": "started", "key": key, "label": label, "route": route_name, "phase": phase, "prompt_head": prompt[:200]})
+        worktree = None
+        try:
+            if isolation == "worktree":
+                worktree, workdir = await asyncio.to_thread(self._make_worktree, overrides.get("dir"), key)
+                overrides = dict(overrides, dir=workdir)
+            res, last_error, skipped, attempts = await self._attempt(prompt, route, route_name, attempt_routes, overrides, initial_spec, label, schema, retries,
+                                                          fork_from, resume, key, session_step, success, cell_fields)
+            if worktree:
+                kept = await asyncio.to_thread(self._settle_worktree, worktree, dir or os.getcwd())
+                if res is not None:
+                    res.worktree = kept
+        except BaseException as e:
+            self.journal.write({"type": "failed", "key": key, "label": label, "route": route_name, "phase": phase, "error": f"aborted: {e!r}"})
+            raise
+        if res is not None and res.ok:
+            if isinstance(route, dict) and res.route == route_name:
+                res.route_spec = route
+            self.journal.write({"type": "completed", "key": key, "label": label, "route": res.route, "phase": phase, "result": res.to_dict()})
+            return res
+        error = last_error or "; ".join(skipped) or "unknown"
+        self.journal.write({"type": "failed", "key": key, "label": label, "route": route_name, "phase": phase, "error": error})
+        if res is not None:
+            # a semantic rejection keeps the worker's text/data/session so the
+            # caller can report what the reviewer actually said
+            return res
+        return AgentResult(ok=False, error=error, route=route_name, label=label, key=key, attempts=attempts, prompt=prompt, **cell_fields)
+
+    async def _attempt(self, prompt, route, route_name, attempt_routes, overrides, initial_spec, label, schema, retries,
+                       fork_from, resume, key, session_step, success, cell_fields):
+        """Try the route, then its fallbacks. Returns (result or None,
+        last dispatch error, skip reasons, dispatches used). The result is the success, or a
+        semantic rejection; None means every route failed or was skipped."""
         last_error = None
+        skipped = []
         attempts = 0
-        semantic_res = None
-        for rname in attempt_routes:
+        session_retried = False
+        i = 0
+        while i < len(attempt_routes):
+            rname = attempt_routes[i]
+            i += 1
             spec = self._resolve_route(rname, overrides)
-            rlabel = rname if isinstance(rname, str) else route_name
-            if (fork_from or resume) and account_scope(spec) != account_scope(initial_spec):
-                last_error = f"route {rlabel} uses a different account from the session"
+            rlabel = route_label(rname)
+            if fork_from is not None and not route_supports_fork(spec):
+                skipped.append(f"route {rlabel} cannot fork")
                 continue
-            if fork_from and not route_supports_fork(spec):
-                last_error = f"route {rlabel} cannot fork"
-                continue
-            if self.preflight and not self._quota_ok(spec):
-                last_error = f"route {rlabel} blocked by quota preflight"
-                self.log(f"{label}: {last_error}")
+            if self.preflight and not await self._quota_ok_async(spec):
+                skipped.append(f"route {rlabel} blocked by quota preflight")
+                self.log(f"{label}: {skipped[-1]}")
                 continue
             res, err = await self._run_with_repair(prompt, spec, rlabel, label, schema, retries, fork_from, resume, key)
             attempts += res.attempts if res is not None else 1
             if res is not None and res.ok:
                 for k, v in cell_fields.items():
                     setattr(res, k, v)
-                if success is not None and not self._semantic_ok(success, res, label):
-                    last_error = "semantic failure: the success predicate rejected a transport-ok result"
-                    self.log(f"{label}: {last_error}")
-                    res.ok = False
-                    res.error = last_error
-                    res.attempts = attempts
-                    res.key = key
-                    res.prompt = prompt
-                    # a semantic failure is a content problem, not a route
-                    # problem: do not burn other routes, like a schema failure
-                    semantic_res = res
-                    break
                 res.attempts = attempts
                 res.key = key
                 res.prompt = prompt
-                self.journal.write({"type": "completed", "key": key, "label": label, "route": rlabel, "result": res.to_dict()})
-                return res
+                if success is not None and not self._semantic_ok(success, res, label):
+                    # a content problem, not a route problem: do not burn other routes
+                    res.ok = False
+                    res.error = "semantic failure: the success predicate rejected a transport-ok result"
+                    self.log(f"{label}: {res.error}")
+                    return res, res.error, skipped, attempts
+                return res, None, skipped, attempts
             last_error = err or (res.error if res is not None else "unknown")
             self.log(f"{label}: route {rlabel} failed: {last_error}")
             if res is not None and res.error and "schema" in res.error:
                 # a schema failure is a model-output problem, not a route problem: do not burn other routes
                 break
-        self.journal.write({"type": "failed", "key": key, "label": label, "route": route_name, "error": last_error})
-        if semantic_res is not None:
-            # keep the worker's text/data/session on the returned result so
-            # the caller can report what the reviewer actually said
-            return semantic_res
-        failed = AgentResult(ok=False, error=last_error, route=route_name, label=label, key=key, attempts=attempts, prompt=prompt, **cell_fields)
-        return failed
+            if session_step and not session_retried and "No conversation found" not in (last_error or ""):
+                # a session step has no fallback, so give its route one more
+                # try after a pause (a missing session will not reappear)
+                session_retried = True
+                self.log(f"{label}: retrying {rlabel} once in {SESSION_RETRY_DELAY:g}s")
+                await asyncio.sleep(SESSION_RETRY_DELAY)
+                attempt_routes.insert(i, rname)
+        return None, last_error, skipped, attempts
 
     # ----- internals -----
     def _resolve_route(self, route, overrides):
@@ -664,7 +881,6 @@ class Workflow:
         for k in ("posture", "effort", "model", "timeout", "dir", "openai_account"):
             if overrides.get(k) is not None:
                 spec[k] = overrides[k]
-        spec["_files"] = overrides.get("files")
         spec["_add_dirs"] = overrides.get("add_dirs")
         if spec.get("openai_account") and (spec.get("harness"), spec.get("provider")) != ("codex", "openai"):
             raise WorkflowError("openai_account requires a codex/openai route")
@@ -705,12 +921,47 @@ class Workflow:
             return not bool(spec.get("openai_account"))
         # 20 exhausted / 22 critically limited block; 21 unknown allows with a note
         ok = code == 0 if spec.get("openai_account") else code not in (20, 22, 23)
-        if code == 21:
+        if code == 21 and ok:
             self.log(f"quota for {qid} unknown; proceeding")
         elif not ok:
             self.log(f"quota preflight blocks {qid} (exit {code})")
         self.quota_cache[cache_key] = ok
         return ok
+
+    async def _quota_ok_async(self, spec):
+        """_quota_ok off the event loop, one probe per cache key at a time, so
+        a slow preflight neither stalls running workers nor runs twice."""
+        cache_key = (spec.get("quota"), account_scope(spec), spec.get("model"))
+        lock = self._quota_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            return await asyncio.to_thread(self._quota_ok, spec)
+
+    def _make_worktree(self, base_dir, key):
+        """Return (worktree root, the matching working dir inside it)."""
+        base = os.path.abspath(base_dir or os.getcwd())
+        path = os.path.join(self.run_dir, "worktrees", key)
+        prefix = subprocess.run(["git", "-C", base, "rev-parse", "--show-prefix"], capture_output=True, text=True)
+        if prefix.returncode != 0:
+            raise WorkflowError(f"isolation='worktree' needs a git checkout at {base}: {prefix.stderr.strip()}")
+        if not os.path.isdir(path):
+            proc = subprocess.run(["git", "-C", base, "worktree", "add", "--detach", path, "HEAD"], capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise WorkflowError(f"isolation='worktree' could not add a worktree of {base}: {proc.stderr.strip()}")
+        return path, os.path.join(path, prefix.stdout.strip())
+
+    def _settle_worktree(self, path, base_dir):
+        """Remove a worktree the worker left untouched; return the path of
+        one it changed (dirty files or new commits), else None."""
+        def git(*a, cwd=path):
+            return subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True).stdout.strip()
+        base = os.path.abspath(base_dir) if base_dir and os.path.abspath(base_dir) != path else None
+        dirty = git("status", "--porcelain")
+        head = git("rev-parse", "HEAD")
+        origin = git("rev-parse", "HEAD", cwd=base) if base else None
+        if dirty or (origin and head != origin):
+            return path
+        subprocess.run(["git", "-C", path, "worktree", "remove", "--force", path], capture_output=True, text=True)
+        return None
 
     def _semantic_ok(self, success, result, label):
         """Evaluate the caller's semantic success predicate. A raising
@@ -738,11 +989,14 @@ class Workflow:
                 msg = err or f"exit {code}: {(text or '')[:300]}"
                 return AgentResult(ok=False, error=msg, route=rlabel, label=label, attempts=attempts, session_id=session_id, run_dir=run_dir, text=text), msg
             last = AgentResult(ok=True, text=text, session_id=session_id, run_dir=run_dir, route=rlabel, label=label,
-                               attempts=attempts, forked=bool(fork_from), openai_account=account_scope(spec),
-                               model=spec.get("model"), effort=spec.get("effort"))
+                               attempts=attempts, forked=fork_from is not None, openai_account=account_scope(spec),
+                               model=spec.get("model"), effort=spec.get("effort"),
+                               harness=spec.get("harness"), provider=spec.get("provider"),
+                               dir=os.path.abspath(spec.get("dir") or os.getcwd()), posture=spec.get("posture", "review"),
+                               add_dirs=spec.get("_add_dirs"))
             if schema is None:
                 return last, None
-            data = extract_json(text)
+            data = extract_json(text, schema)
             verr = validate_schema(data, schema) if data is not None else "no JSON object found in the reply"
             if verr is None:
                 last.data = data
@@ -751,14 +1005,19 @@ class Workflow:
                 last.ok = False
                 last.error = f"structured output failed schema after {attempts} attempts: {verr}"
                 return last, last.error
-            session = session_id
-            current_prompt = (f"Your previous reply did not satisfy the required output contract ({verr}). "
-                              f"Reply again with ONLY a JSON value matching this schema, no prose and no code fences:\n{json.dumps(schema)}")
+            repair = (f"Your previous reply did not satisfy the required output contract ({verr}). "
+                      f"Reply again with ONLY a JSON value matching this schema, no prose and no code fences:\n{json.dumps(schema)}")
+            if session_id:
+                session, current_prompt = session_id, repair
+            else:
+                # nothing to resume: re-send the task with the repair appended,
+                # from the same starting point (re-fork or re-resume)
+                session = resume
+                fork_id = fork_from.session_id if fork_from is not None else None
+                current_prompt = prompt + "\n\n" + repair
             self.log(f"{label}: repairing structured output (attempt {attempts + 1})")
 
     async def _dispatch(self, prompt, spec, rlabel, label, key, fork_id=None, resume_id=None):
-        if self.max_agents and self.dispatched >= self.max_agents:
-            raise WorkflowError(f"--max-agents {self.max_agents} reached before dispatching '{label}'")
         step_dir = os.path.join(self.run_dir, "steps", key)
         os.makedirs(step_dir, exist_ok=True)
         n = len([f for f in os.listdir(step_dir) if f.startswith("prompt")]) + 1
@@ -785,21 +1044,30 @@ class Workflow:
         elif resume_id:
             cmd += ["--resume", resume_id]
         sem = self._sem_for(spec, rlabel)
-        async with self.global_sem:
-            async with sem:
+        limit = float(spec.get("timeout") or 1800) + 60
+        # route slot first, so a task queued behind a busy route does not hold a global slot
+        async with sem:
+            async with self.global_sem:
+                # checked and counted with no await between: a hard cap even under parallel()
+                if self.max_agents and self.dispatched >= self.max_agents:
+                    raise WorkflowError(f"--max-agents {self.max_agents} reached before dispatching '{label}'")
                 self.dispatched += 1
                 self.log(f"dispatch {self.dispatched}: {label} -> {rlabel} ({spec['harness']}/{spec['model']})" + (f" fork={fork_id}" if fork_id else "") + (f" resume={resume_id}" if resume_id else ""))
                 with open(os.path.join(step_dir, f"dispatch-{n}.log"), "a") as lg:
                     lg.write(" ".join(shlex.quote(c) for c in cmd) + "\n")
-                proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True)
+                # A plain Popen drained in a thread, not asyncio's subprocess API:
+                # on Python < 3.12 cancelling a task mid-spawn (as asyncio.run does
+                # to every task at shutdown) hangs forever inside asyncio.
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
                 try:
-                    out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=float(spec.get("timeout") or 1800) + 60)
-                except asyncio.TimeoutError:
-                    try:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    return None, None, None, 124, f"timed out after {spec.get('timeout')}s"
+                    out_b, err_b = await asyncio.get_running_loop().run_in_executor(self.pool, _communicate, proc, limit)
+                except BaseException:
+                    # cancellation or orchestrator shutdown: the worker's whole
+                    # process group goes with this step, never orphaned
+                    _kill_group(proc)
+                    raise
+                if out_b is None:
+                    return None, None, None, 124, f"timed out after {limit:g}s"
         out = out_b.decode("utf-8", "replace")
         errtxt = err_b.decode("utf-8", "replace")
         with open(os.path.join(step_dir, f"dispatch-{n}.log"), "a") as lg:
@@ -830,7 +1098,7 @@ class Workflow:
         err = None
         if code != 0:
             err = f"exit {code}: {(text or errtxt or out)[-300:].strip()}"
-        elif text is not None and any(p in text for p in RETRYABLE_PATTERNS) and len(text) < 400:
+        elif text is not None and len(text) < 400 and PROVIDER_ERROR_RE.search(text):
             err = f"provider error text: {text[:300]}"
         with open(os.path.join(step_dir, f"result-{n}.json"), "w") as fh:
             json.dump({"run_dir": run_dir, "session_id": session_id, "exit": code, "error": err, "text": text}, fh, ensure_ascii=False, indent=1)
@@ -864,39 +1132,78 @@ def run_dir_for(run_id):
     return os.path.join(STATE_ROOT, "runs", run_id)
 
 
-def write_run_meta(run_dir, **fields):
+def read_run_meta(run_dir):
     p = os.path.join(run_dir, "run.json")
-    meta = {}
-    if os.path.exists(p):
+    try:
         with open(p) as fh:
             meta = json.load(fh)
+        return meta if isinstance(meta, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_run_meta(run_dir, **fields):
+    meta = read_run_meta(run_dir)
     meta.update(fields)
-    with open(p, "w") as fh:
+    p = os.path.join(run_dir, "run.json")
+    with open(p + ".tmp", "w") as fh:
         json.dump(meta, fh, indent=1, ensure_ascii=False)
+    os.replace(p + ".tmp", p)
     return meta
 
 
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt(signal.Signals(signum).name)
+
+
 def cmd_run(ns):
-    mod, meta = load_script(os.path.abspath(ns.script))
-    run_id = ns.resume or (dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + re.sub(r"[^a-z0-9]+", "-", meta.get("name", "wf").lower()).strip("-")[:30] + "-" + uuid.uuid4().hex[:6])
-    run_dir = run_dir_for(run_id)
-    os.makedirs(os.path.join(run_dir, "steps"), exist_ok=True)
+    script = os.path.abspath(ns.script)
+    mod, meta = load_script(script)
     args = parse_args_value(ns.args)
     routes = load_routes(ns.routes)
     dispatcher = find_dispatcher()
+    previous = {}
+    if ns.resume:
+        if os.sep in ns.resume or not os.path.exists(os.path.join(run_dir_for(ns.resume), "journal.jsonl")):
+            raise SystemExit(f"headless-workflow: no such run to resume: {ns.resume}")
+        previous = read_run_meta(run_dir_for(ns.resume))
+        if ns.args is None:
+            args = previous.get("args")
+        elif args != previous.get("args"):
+            print("headless-workflow: --args differ from the original run; changed prompts will run live", file=sys.stderr)
+        if previous.get("cwd") and previous["cwd"] != os.getcwd():
+            print(f"headless-workflow: resuming from {os.getcwd()}, the run started in {previous['cwd']}; "
+                  "steps without an explicit dir= will be served from the original directory's results", file=sys.stderr)
+    run_id = ns.resume or (dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + re.sub(r"[^a-z0-9]+", "-", meta.get("name", "wf").lower()).strip("-")[:30] + "-" + uuid.uuid4().hex[:6])
+    run_dir = run_dir_for(run_id)
+    os.makedirs(os.path.join(run_dir, "steps"), exist_ok=True)
+    if os.path.exists(os.path.join(run_dir, "result.json")):
+        os.replace(os.path.join(run_dir, "result.json"), os.path.join(run_dir, "result.prev.json"))
     preflight = not (ns.no_preflight or os.environ.get("HEADLESS_WORKFLOW_NO_PREFLIGHT") == "1")
-    write_run_meta(run_dir, run_id=run_id, name=meta.get("name"), description=meta.get("description"), script=os.path.abspath(ns.script),
-                   args=args, status="running", started_at=now_iso(), resumed=bool(ns.resume), dispatcher=dispatcher, cwd=os.getcwd())
+    now = now_iso()
+    fields = dict(run_id=run_id, name=meta.get("name"), description=meta.get("description"), script=script,
+                  args=args, status="running", resumed=bool(ns.resume), dispatcher=dispatcher, error=None, finished_at=None)
+    if ns.resume:
+        fields["resumes"] = previous.get("resumes", []) + [now]
+        fields.setdefault("started_at", previous.get("started_at") or now)
+    else:
+        fields.update(started_at=now, cwd=os.getcwd())
+    write_run_meta(run_dir, **fields)
     print(f"RUN_ID : {run_id}\nRUN_DIR: {run_dir}\nLOG    : {os.path.join(run_dir, 'log.txt')}", flush=True)
     wf = Workflow(run_id, run_dir, routes, dispatcher, ns.max_agents, ns.concurrency, preflight, ns.quiet, args)
-    wf.journal.write({"type": "run-started", "resumed": bool(ns.resume), "script": os.path.abspath(ns.script)})
-    status = "completed"
-    result = None
-    error = None
+    wf.script_dir = os.path.dirname(script)
+    wf.journal.write({"type": "run-started", "resumed": bool(ns.resume), "script": script, "args": args})
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) is not signal.SIG_IGN:  # keep nohup's ignored SIGHUP
+            signal.signal(sig, _interrupt)
+    status, result, error = "completed", None, None
     try:
         result = asyncio.run(mod.main(wf, args))
         with open(os.path.join(run_dir, "result.json"), "w") as fh:
             json.dump(result, fh, indent=1, ensure_ascii=False, default=lambda o: o.to_dict() if hasattr(o, "to_dict") else str(o))
+    except KeyboardInterrupt as e:
+        # asyncio.run cancelled every task on the way out, which killed each worker's process group
+        status, error = "interrupted", f"interrupted ({e or 'SIGINT'})"
     except WorkflowError as e:
         status, error = "failed", str(e)
     except Exception as e:  # noqa: BLE001
@@ -905,7 +1212,7 @@ def cmd_run(ns):
     write_run_meta(run_dir, status=status, error=error, finished_at=now_iso(), dispatched=wf.dispatched)
     if status != "completed":
         print(f"headless-workflow: run {run_id} {status}: {error}", file=sys.stderr)
-        return 1
+        return 130 if status == "interrupted" else 1
     print(f"RESULT : {os.path.join(run_dir, 'result.json')}\nSTATUS : completed ({wf.dispatched} dispatches)", flush=True)
     return 0
 
@@ -914,14 +1221,14 @@ def cmd_status(ns):
     run_dir = run_dir_for(ns.run_id)
     if not os.path.isdir(run_dir):
         raise SystemExit(f"no such run: {ns.run_id}")
-    meta = {}
-    if os.path.exists(os.path.join(run_dir, "run.json")):
-        with open(os.path.join(run_dir, "run.json")) as fh:
-            meta = json.load(fh)
+    meta = read_run_meta(run_dir)
     j = Journal(run_dir)
     print(f"run {ns.run_id}: {meta.get('status', '?')} (started {meta.get('started_at')}, finished {meta.get('finished_at')}, dispatched {meta.get('dispatched', '?')})")
     if meta.get("error"):
         print(f"error: {meta['error']}")
+    if not os.path.exists(j.path):
+        print("  (no journal yet)")
+        return 0
     phase = None
     with open(j.path) as fh:
         for lineno, line in enumerate(fh, 1):
@@ -940,6 +1247,12 @@ def cmd_status(ns):
                 phase = title
                 print(f"== {phase}")
             elif e.get("type") in ("started", "completed", "failed"):
+                # steps carry their own phase: under pipeline()/parallel() the
+                # journal order of phase events does not say where a step belongs
+                step_phase = e.get("phase") if isinstance(e.get("phase"), str) else None
+                if step_phase != phase and (step_phase or "phase" in e):
+                    phase = step_phase
+                    print(f"== {phase or '(no phase)'}")
                 state = e["type"]
                 extra = ""
                 if state == "completed":
@@ -956,8 +1269,9 @@ def cmd_status(ns):
 
 def cmd_result(ns):
     p = os.path.join(run_dir_for(ns.run_id), "result.json")
-    if not os.path.exists(p):
-        raise SystemExit(f"no result for run {ns.run_id} (still running or failed)")
+    status = read_run_meta(run_dir_for(ns.run_id)).get("status")
+    if status != "completed" or not os.path.exists(p):
+        raise SystemExit(f"no result for run {ns.run_id} (status: {status or 'unknown'})")
     with open(p) as fh:
         sys.stdout.write(fh.read())
     return 0
@@ -969,10 +1283,7 @@ def cmd_list(ns):
         return 0
     for rid in sorted(os.listdir(root)):
         p = os.path.join(root, rid, "run.json")
-        status = "?"
-        if os.path.exists(p):
-            with open(p) as fh:
-                status = json.load(fh).get("status", "?")
+        status = read_run_meta(os.path.join(root, rid)).get("status", "?")
         print(f"{rid}\t{status}")
     return 0
 

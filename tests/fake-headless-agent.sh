@@ -10,6 +10,10 @@
 #   @@FAIL_IF_MODEL:name@@         -> exit 1 with a 429 message when --model matches
 #   @@SLEEP:seconds@@              -> sleep before answering
 #   @@ECHO_PARENT@@                -> final.txt mentions parent=<session id> for fork/resume
+#   @@NOSESSION@@                  -> no session_id file (a harness that could not report one)
+#   @@FAIL_FIRST_FORK@@            -> the first fork of a given parent exits 1 with a 429
+# Like real Claude Code, a claude_code --fork/--resume only finds a session from
+# the directory it was created in ("No conversation found" otherwise).
 # Every call appends one JSON line to $FAKE_RUN_ROOT/calls.log for assertions.
 set -euo pipefail
 ROOT="${FAKE_RUN_ROOT:-${TMPDIR:-/tmp}/fake-headless}"
@@ -28,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     --posture) posture="$2"; shift 2;;
     --dir) dir="$2"; shift 2;;
     --add-dir) shift 2;;
+    --context) shift 2;;
     --timeout) shift 2;;
     --prompt) prompt="$2"; shift 2;;
     --prompt-file) prompt="$(cat "$2")"; shift 2;;
@@ -41,7 +46,7 @@ done
 # fork is only native on these harnesses, like the real router
 if [[ -n "$fork" ]]; then
   case "$harness" in
-    claude_code|codex|opencode|prime-agent) ;;
+    claude_code|codex|opencode|pi|prime-agent) ;;
     *) echo "headless-agent: --fork unsupported on harness $harness" >&2; exit 2;;
   esac
 fi
@@ -51,7 +56,15 @@ n=$(( $(cat "$ROOT/counter" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" > "$
 rd="$ROOT/run-$(printf '%04d' "$n")"; mkdir -p "$rd" "$ROOT/sessions"
 printf '%s' "$prompt" > "$rd/prompt.txt"
 if [[ -n "$fork" ]]; then sid="fork-of-$fork-$n"; elif [[ -n "$resume" ]]; then sid="$resume"; else sid="sess-$n"; fi
-printf '%s\n' "$sid" > "$rd/session_id"
+[[ "$prompt" == *"@@NOSESSION@@"* ]] || printf '%s\n' "$sid" > "$rd/session_id"
+parent_sid="${fork:-$resume}"
+if [[ -n "$parent_sid" && "$harness" == claude_code && -f "$ROOT/sessions/$parent_sid.dir" && "$(cat "$ROOT/sessions/$parent_sid.dir")" != "$dir" ]]; then
+  printf 'No conversation found with session ID: %s' "$parent_sid" > "$rd/final.txt"; printf '1\n' > "$rd/exit_code"
+  printf '{"n":%d,"harness":"%s","label":"%s","fork":"%s","resume":"%s","dir":"%s","code":1}\n' "$n" "$harness" "$label" "$fork" "$resume" "$dir" >> "$ROOT/calls.log"
+  printf 'DISPATCH_ID : fake-%s\nRUN_DIR : %s\n' "$n" "$rd"
+  exit 1
+fi
+printf '%s' "$dir" > "$ROOT/sessions/$sid.dir"
 # session history: a resumed or forked session sees its parent's prompts, like a real harness
 hist=""
 if [[ -n "$fork" ]]; then hist="$(cat "$ROOT/sessions/$fork.prompt" 2>/dev/null || true)"; fi
@@ -62,7 +75,9 @@ printf '{"tool":"fake","harness":"%s","provider":"%s","model":"%s","effort":"%s"
 start=$(date +%s.%N)
 if [[ "$prompt" =~ @@SLEEP:([0-9.]+)@@ ]]; then sleep "${BASH_REMATCH[1]}"; fi
 code=0; out="OK: $label"
-if [[ "$prompt" =~ @@FAIL_IF_MODEL:([^@]+)@@ ]] && [[ "$model" == "${BASH_REMATCH[1]}" ]]; then
+if [[ -n "$fork" && "$prompt" == *"@@FAIL_FIRST_FORK@@"* ]] && mkdir "$ROOT/failed-fork-$fork" 2>/dev/null; then
+  out="API Error: Request rejected (429) rate limit"; code=1
+elif [[ "$prompt" =~ @@FAIL_IF_MODEL:([^@]+)@@ ]] && [[ "$model" == "${BASH_REMATCH[1]}" ]]; then
   out="API Error: Request rejected (429) rate limit"; code=1
 elif [[ "$prompt" =~ @@REPLY:([^@]*)@@ ]]; then out="${BASH_REMATCH[1]}"
 elif [[ "$prompt" =~ @@JSON:(\{[^@]*\})@@ ]]; then
@@ -76,6 +91,8 @@ end=$(date +%s.%N)
 printf '%s\n' "$openai_account" > "$rd/openai_account"
 printf '%s\n' "$stream_format" > "$rd/format"
 printf '{"n":%d,"harness":"%s","provider":"%s","model":"%s","effort":"%s","posture":"%s","label":"%s","fork":"%s","resume":"%s","start":%s,"end":%s,"code":%d}\n' "$n" "$harness" "$provider" "$model" "$effort" "$posture" "$label" "$fork" "$resume" "$start" "$end" "$code" >> "$ROOT/calls.log"
+# dir goes in a sidecar log so existing calls.log consumers keep their shape
+printf '{"n":%d,"dir":"%s"}\n' "$n" "$dir" >> "$ROOT/dirs.log"
 printf 'DISPATCH_ID : fake-%s\n' "$n"
 printf 'RUN_DIR : %s\nSTREAM  : %s/stream.jsonl\nFINAL   : %s/final.txt\nPID     : %s\n' "$rd" "$rd" "$rd" "$$"
 if [[ "$wait" == 1 ]]; then printf -- '--- FINAL (exit %s) ---\n%s\n' "$code" "$out"; fi
