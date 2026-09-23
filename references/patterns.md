@@ -12,10 +12,11 @@ VERDICT = {"type": "object", "required": ["refuted", "reasoning"], "properties":
 REVIEW = {"type": "object", "required": ["verdict", "findings"]}
 ```
 
-When several workers need the same large context, start with
+Whenever several workers need the same context, start with
 [explore once, fork many](fork-fanout.md). It is the largest token saving
-available, and it combines with every shape below: fork the finders, judges or
-reviewers from one explorer instead of giving each of them the material fresh.
+available, and it combines with every shape below. Fork the finders, the
+panel members, the analysts or the specialists from one explorer instead of
+giving each of them the material fresh.
 
 ## Digest → judge → verify → synthesize
 
@@ -57,8 +58,9 @@ async def main(wf, args):
 ## Shared-context fork fan-out
 
 Moved to [fork-fanout.md](fork-fanout.md), with the rules that make the cache
-hit, explorer sizing, sharding, and when not to fork. The runnable recipe is
-`examples/fork-fanout.py`.
+hit, where it fits, explorer sizing, sharding, and when not to fork. The
+runnable general runner is `examples/fork-fanout.py`; `examples/fork-review.py`
+is its code-review instance.
 
 ## Loop until dry
 

@@ -373,7 +373,7 @@ class TestForkFanoutExample(Base):
                     {"id": "c-1", "title": "off by one", "file": "a.py", "line": 3, "claim": "loop skips last " + verdict},
                     {"id": "c-2", "title": "bogus", "file": "a.py", "line": 9, "claim": "never happens"}]})},
                 {"key": "security", "focus": marker({"findings": []})}]
-        example = pathlib.Path(SCRIPT).parent.parent / "examples" / "fork-fanout.py"
+        example = pathlib.Path(SCRIPT).parent.parent / "examples" / "fork-review.py"
         proc = self.h.run("run", str(example), "--args", json.dumps(
             {"root": self.h.tmp, "target": "the diff", "dimensions": dims}))
         res = self.result(self.h.run_id_from(proc))
@@ -388,6 +388,27 @@ class TestForkFanoutExample(Base):
         self.assertTrue(all(x["fork"] == "sess-1" for x in forks))
         self.assertTrue(all(dirs(self.h)[x["n"]] == self.h.tmp for x in forks))
         self.assertEqual(len(c), 5, "explorer + 2 reviews + 1 verify + synthesis")
+
+
+    def test_general_runner_forks_every_task_and_the_synthesis_from_one_explorer(self):
+        from test_examples import marker
+        tasks = ["Where is the retry loop? @@REPLY:in client.py@@",
+                 {"key": "plan", "prompt": "Plan the change. " + marker({"steps": ["a", "b"]}),
+                  "schema": {"type": "object", "required": ["steps"]}}]
+        example = pathlib.Path(SCRIPT).parent.parent / "examples" / "fork-fanout.py"
+        proc = self.h.run("run", str(example), "--args", json.dumps(
+            {"root": self.h.tmp, "context": "the client module", "tasks": tasks, "synthesize": "Combine."}))
+        res = self.result(self.h.run_id_from(proc))
+        self.assertEqual([r["key"] for r in res["results"]], ["task-1", "plan"])
+        self.assertEqual(res["results"][0]["output"], "in client.py")
+        self.assertEqual(res["results"][1]["output"], {"steps": ["a", "b"]})
+        self.assertIsNotNone(res["synthesis"])
+        c = calls(self.h)
+        self.assertFalse(c[0]["fork"])
+        forks = [x for x in c if x["fork"]]
+        self.assertEqual(len(forks), 3, "two tasks and the synthesis fork the explorer")
+        self.assertTrue(all(x["fork"] == "sess-1" and dirs(self.h)[x["n"]] == self.h.tmp for x in forks))
+        self.assertEqual(len(c), 4)
 
 
 if __name__ == "__main__":

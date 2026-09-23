@@ -13,13 +13,15 @@ instead of a turn per worker.
 - `references/api.md` — full API, route fields, run-directory layout, CLI
 - `references/patterns.md` — digest→judge→verify→synthesize,
   loop-until-dry, issue swarm, cheap Codex wait
-- `references/fork-fanout.md` — explore once, fork many: cache rules, sizing,
-  sharding, economics, when not to fork
+- `references/fork-fanout.md` — explore once, fork many: where it fits,
+  cache rules, sizing, sharding, economics, when not to fork
 - `examples/` — runnable scripts
   - `campaign-audit.py` — digest, judge per lane, consequence check,
     evidence check, synthesize
-  - `fork-fanout.py` — one explorer, one forked reviewer and verifier per
-    review dimension, one synthesizer
+  - `fork-fanout.py` — the general runner: one explorer gathers context,
+    one fork per task, optional synthesis
+  - `fork-review.py` — code-review instance: forked reviewer and verifier
+    per dimension, one synthesizer
 - `tests/` — unit tests driven by `tests/fake-headless-agent.sh`, a stand-in
   that mirrors the real dispatcher's stdout and run-dir contract
 

@@ -1,21 +1,44 @@
 # Explore once, fork many
 
-Most review, audit and research workflows have many workers that need the same
-large context: the same diff, spec or module set. If each worker is fresh, each
-one re-reads that context at full input price and spends turns finding it again.
-Instead, have one explorer read the material into its session, then start every
-worker as a native fork of that session. Each child begins with the explorer's
-full history (the files it read, verbatim), and the provider serves that shared
-prefix from its prompt cache. You pay for the exploration once. The other N
-workers pay the cached-input rate for the shared prefix, plus their own work.
+Many tasks have the same shape: gather context, then do several separate
+things with it. Examples are specialists that each take one angle, deep dives
+into separate parts, or alternatives built from the same facts. If each worker
+starts fresh, each one re-reads the context at full input price and spends
+turns finding it again. Instead, have one explorer read the material into its
+session, then start every worker as a native fork of that session. Each child
+begins with the explorer's full history (the files it read, verbatim), and the
+provider serves that shared prefix from its prompt cache. You pay for the
+exploration once. The other N workers pay the cached-input rate for the shared
+prefix, plus their own work.
 
 Use this pattern by default whenever three or more workers would otherwise read
-the same material. `examples/fork-fanout.py` is a runnable version for code
-review.
+the same material, whatever the task. `examples/fork-fanout.py` is a general
+runner: pass it the context to gather and a list of tasks.
+`examples/fork-review.py` is one instance, code review with a verify stage.
+
+## Where it fits
+
+Look for a phase that gathers context and is followed by work that splits.
+Each child's prompt names one slice of that work:
+
+| Shape | Explorer gathers | Each fork |
+|---|---|---|
+| Specialist lenses | a change, design doc, contract or config | reviews or audits it for one concern (security, performance, API compatibility, accessibility, compliance) |
+| Question fan-out | a codebase area, corpus, dataset or log set | answers one question, with citations |
+| Hypothesis fan-out | a bug report, reproduction, logs and the suspect code | pursues one hypothesis to confirm or rule it out |
+| Per-unit planning | a library's new API plus the call sites to migrate | plans one module's migration; fresh writers then apply each plan in its own worktree |
+| Alternatives | requirements, constraints and the existing system | drafts one design or approach for a judge panel to compare |
+| Deep-dive tree | the overview of a large system | explores one subsystem, and forks its own children from there |
+| Parallel authoring | the source material and an outline | writes one section, test file or doc page |
+| Repeated rounds | the target | runs one finder round of a loop-until-dry search, so later rounds skip re-exploration |
+
+The shapes combine with the other patterns. For example, fork the finders of a
+loop-until-dry search, fork the members of a judge panel, or fork the analysts
+whose plans feed an issue swarm.
 
 ## What it saves
 
-Take a 200k-token explorer context and 15 review dimensions:
+Take a 200k-token explorer context and 15 workers:
 
 | | Shared-context input the 15 workers pay for | Exploration turns |
 |---|---|---|
@@ -86,40 +109,43 @@ by default it keeps the parent's route, model, effort, `dir`, `posture` and
 
 ## Writing the explorer
 
-- Make it read, not review. It should open the diff and the code each hunk
-  depends on with its file tools. Children inherit tool results verbatim, and
-  those are what they will not have to re-read. In review posture a `pi-*`
-  explorer has no shell, so give it a patch file
-  (`git diff origin/main...HEAD > change.patch`) rather than a git command.
+- Make it gather, not work. It should open the material with its file tools:
+  the spec, the code, the logs, the change and what that change depends on.
+  Children inherit tool results verbatim, and those are what they will not have
+  to re-read. Tell it not to start on any child's task, because its
+  conclusions would bias every child. In review posture a `pi-*` explorer has
+  no shell, so give it files (for a change,
+  `git diff origin/main...HEAD > change.patch`) rather than a command.
 - Never run the explorer with `isolation="worktree"`: its clean worktree is
   removed when it finishes, and forks must run in the explorer's directory.
 - End it with a short reply. The explorer's final message and each child's
-  prompt are the only parts a child pays full price for. A file map of at most
-  ~60 lines (`path - role`) is useful and cheap. Do not end with a summary of
-  the code.
+  prompt are the only parts a child pays full price for. A map of what it read
+  (at most ~60 lines of `source - what it holds`) is useful and cheap. Do not
+  end with a summary of the material.
 - Keep it under about half the model's window. Children need room for their own
   work. A child that runs out of window auto-compacts, which replaces the shared
   prefix with a summary and loses the cache (and detail). Budget 10–20 tokens
-  per line of code: a 20,000-line PR is about 200k–400k tokens before
-  surrounding context. That needs a long-context model (e.g. `model="opus[1m]"`
+  per line of code or text: a 20,000-line PR or codebase slice is about
+  200k–400k tokens before surrounding context. That needs a long-context model (e.g. `model="opus[1m]"`
   on the explorer, which its forks inherit) or sharding.
 
-## Sharding a change too big for one explorer
+## Sharding context too big for one explorer
 
-Split the change into K groups of files that belong together. Run one explorer
-per group, and fork each group's dimension reviewers from that group's explorer.
-Each group's findings still need the verify stage from `examples/fork-fanout.py`.
-A shard explorer never read the other groups, so verify a finding that cites
-files outside its group with a fresh agent in `dir=root`, not with a fork. The
-synthesizer can only correlate reported findings. For defects that span groups
-(a caller in one breaking a callee in another), add a fresh agent in `dir=root`
-over the groups' file maps and the interfaces between them.
+Split the material into K groups that belong together, for example by
+subsystem, document set or time window. Run one explorer per group, and fork
+each group's workers from that group's explorer. A shard explorer never read
+the other groups, so check any output that cites material outside its group
+with a fresh agent in `dir=root`, not with a fork. The synthesizer can only
+correlate what the workers reported. For effects that span groups (a caller in
+one breaking a callee in another), add a fresh agent in `dir=root` over the
+groups' maps and the interfaces between them. The snippet below shows code
+review; for findings, keep the verify stage from `examples/fork-review.py`.
 
 Shards on one route compete for its `max_concurrency` slots, first come first
 served. A later shard's explorer prefix can go cold while it waits. Run the
 shards one after another, or raise the route's cap to about K times one shard's
 width. This snippet uses the prompt and schema constants from
-`examples/fork-fanout.py`:
+`examples/fork-review.py`:
 
 ```python
 async def main(wf, args):
@@ -140,17 +166,19 @@ async def main(wf, args):
 ```
 
 A fork can itself be forked. For example, an explorer can fork one deep-dive
-per subsystem, and each deep-dive can fork its dimension reviewers. Each level
+per subsystem, and each deep-dive can fork its own specialists. Each level
 inherits everything above it, so each level must also fit in the window.
 
 ## When not to fork
 
 - **Independent verification or judging.** A child inherits everything its
-  parent concluded. Never verify a finding by forking the agent that produced
+  parent concluded. Never verify a result by forking the agent that produced
   it. Forking the *explorer* is fine for verification, because the explorer
   only read and never judged, and it is cheap. For the most independence, use a
-  fresh agent on a different model (`examples/fork-fanout.py` takes
-  `verify_route` for this).
+  fresh agent on a different model (`examples/fork-review.py` takes
+  `verify_route` for this). The same holds for alternatives: forks of one
+  explorer share its facts, which is what you want, but a judge of those
+  alternatives should not be one of them.
 - **Children that write files.** Parallel writers need separate worktrees, and a
   separate worktree breaks rule 2. Fork read-only analysts, then hand their
   plans to fresh writers with `isolation="worktree"`.
@@ -177,6 +205,6 @@ grep -ho '"cacheRead":[0-9]*' "$RUN_DIR"/stream.* | tail -1                 # pi
 `steps/<key>/result-N.json` under the workflow run directory. A child's
 cached tokens should be close to the explorer's context size. If they are near
 zero, one of the rules above is being broken. To go on to the full fan-out,
-`--resume` the probe run with the full dimension list. The explorer is then
+`--resume` the probe run with the full task list. The explorer is then
 served from the journal, and the new forks branch from its session while the
 prefix is still warm.

@@ -1,6 +1,6 @@
 ---
 name: headless-workflow
-description: Orchestrate a resumable graph of headless workers with bounded concurrency and cached steps. Use when a task needs multiple dependent or parallel workers and durable orchestration beyond one headless-agent run.
+description: Orchestrate a resumable graph of headless workers with bounded concurrency and cached steps. Use when a task needs multiple dependent or parallel workers and durable orchestration beyond one headless-agent run, including forking many specialists from one shared exploration.
 ---
 
 # Headless workflow
@@ -18,28 +18,31 @@ Derive `SKILL_DIR` from this loaded skill; `HW="$SKILL_DIR/scripts/headless-work
 
 ## Explore once, fork many
 
-When several workers need the same large context (one diff, spec or module
-set), do not give each worker that context fresh. Have **one explorer read it,
-then fork every worker from the explorer's session**. Each fork starts with the
-explorer's full history and reads it from the provider's prompt cache at about
-0.1× input price. A 15-dimension review of a large PR then pays for reading the
-PR once, not 15 times, and every reviewer skips straight to its own work.
+Use this for any task that gathers context and then splits into several
+pieces of work: specialists that each take one angle, questions over one
+corpus, hypotheses about one bug, per-module plans, design alternatives, doc
+sections, or subsystem deep dives. Do not give each worker the context fresh.
+Have **one explorer gather it, then fork every worker from the explorer's
+session**. Each fork starts with the explorer's full history and reads it from
+the provider's prompt cache at about 0.1× input price. Fifteen workers over a
+large codebase then pay for reading it once, not 15 times, and every worker
+skips straight to its own part.
 
 ```python
-explorer = await wf.agent(f"Read {target} and the code it touches. Do not review. Reply with a file map.",
+explorer = await wf.agent(f"Gather {context} with your tools. Do not start any task. Reply with a map of what you read.",
                           route="sonnet", dir=root, fallback=[], label="explore")
-reviews = await wf.parallel([
-    (lambda d=d: wf.fork(explorer, f"Review only for {d}. JSON findings.", schema=FINDINGS,
-                         require_native=True, label=f"review:{d}"))
-    for d in dimensions])
+results = await wf.parallel([
+    (lambda t=t: wf.fork(explorer, t, schema=SCHEMA, require_native=True, label=t[:40]))
+    for t in tasks])
 ```
 
 Before writing one, read [fork-fanout](references/fork-fanout.md). It covers
-the cache rules (a fork keeps the parent's route, model, effort, dir and
-posture; do not override them), explorer sizing and sharding for changes
-bigger than one context window, provider economics, when not to fork, and how
-to confirm cache hits. `examples/fork-fanout.py` is the full
-explore → review → verify → synthesize recipe.
+where the pattern fits, the cache rules (a fork keeps the parent's route,
+model, effort, dir and posture; do not override them), explorer sizing and
+sharding for context bigger than one window, provider economics, when not to
+fork, and how to confirm cache hits. Run `examples/fork-fanout.py` directly
+with your context and task list, or copy it. `examples/fork-review.py` is the code-review instance, with a verify
+stage.
 
 ## Write the script
 
