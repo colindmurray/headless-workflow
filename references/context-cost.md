@@ -16,6 +16,8 @@ twice on `gpt-5.6-luna` at low effort, once through `codex` and once through
 
 Both produced 20 digests, 4 analyses, and a report of the same length reaching
 the same recommendation — a 20x token saving and a 1.9x speedup at equal output.
+This measurement predates the GPT-6 routes and has not been repeated on
+`gpt-6-*` models.
 
 The saving comes from `context: lean`, not from pi itself. Codex loads the whole
 skill tree into every worker and cannot be told not to; it even warns that it

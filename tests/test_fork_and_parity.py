@@ -138,7 +138,7 @@ class TestForkPlacement(Base):
         _, rid = self.run_wf("""
         META = {"name": "ffail", "description": "d"}
         async def main(wf, args):
-            p = await wf.agent("x @@FAIL_IF_MODEL:sonnet@@", route="sonnet", label="p")
+            p = await wf.agent("x @@FAIL_IF_MODEL:opus@@", route="opus", label="p")
             k = await wf.fork(p, "child", label="k")
             return {"ok": k.ok, "error": k.error}
         """)
@@ -151,7 +151,7 @@ class TestResumeIdentity(Base):
     VOTERS = """
     META = {"name": "voters", "description": "d"}
     async def main(wf, args):
-        vs = await wf.parallel([lambda: wf.agent("refute X", route="sonnet") for _ in range(3)])
+        vs = await wf.parallel([lambda: wf.agent("refute X", route="opus") for _ in range(3)])
         return [v.ok for v in vs]
     """
 
@@ -170,7 +170,7 @@ class TestResumeIdentity(Base):
         body = """
         META = {"name": "argy", "description": "d"}
         async def main(wf, args):
-            r = await wf.agent("say " + args["w"], route="sonnet")
+            r = await wf.agent("say " + args["w"], route="opus")
             return args["w"]
         """
         _, rid = self.run_wf(body, "--args", '{"w": "hi"}')
@@ -203,7 +203,7 @@ class TestFatalAndLifecycle(Base):
         proc, rid = self.run_wf("""
         META = {"name": "cap", "description": "d"}
         async def main(wf, args):
-            return await wf.parallel([lambda i=i: wf.agent(f"t{i}", route="sonnet") for i in range(6)])
+            return await wf.parallel([lambda i=i: wf.agent(f"t{i}", route="opus") for i in range(6)])
         """, "--max-agents", "2", check=False)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("max-agents", proc.stderr)
@@ -217,7 +217,7 @@ class TestFatalAndLifecycle(Base):
         script = self.h.write_script("""
         META = {"name": "slow", "description": "d"}
         async def main(wf, args):
-            return await wf.agent("wait @@SLEEP:30@@", route="sonnet", label="slow")
+            return await wf.agent("wait @@SLEEP:30@@", route="opus", label="slow")
         """)
         proc = subprocess.Popen([sys.executable, str(SCRIPT), "run", script], env=self.h.env(),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -265,7 +265,7 @@ class TestFatalAndLifecycle(Base):
         script = self.h.write_script("""
         META = {"name": "hup", "description": "d"}
         async def main(wf, args):
-            return (await wf.agent("wait @@SLEEP:1.5@@ @@REPLY:done@@", route="sonnet")).text
+            return (await wf.agent("wait @@SLEEP:1.5@@ @@REPLY:done@@", route="opus")).text
         """)
         proc = subprocess.Popen(["nohup", sys.executable, str(SCRIPT), "run", script], env=self.h.env(),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=self.h.tmp)
@@ -281,7 +281,7 @@ class TestFatalAndLifecycle(Base):
         META = {"name": "heur", "description": "d"}
         S = {"type": "object", "required": ["line"]}
         async def main(wf, args):
-            r = await wf.agent('@@JSON:{"line": 502, "note": "missing timeout"}@@', route="sonnet", schema=S)
+            r = await wf.agent('@@JSON:{"line": 502, "note": "missing timeout"}@@', route="opus", schema=S)
             return {"ok": r.ok, "attempts": r.attempts}
         """)
         self.assertEqual(self.result(rid), {"ok": True, "attempts": 1})
@@ -291,7 +291,7 @@ class TestFatalAndLifecycle(Base):
         META = {"name": "nosess", "description": "d"}
         S = {"type": "object", "required": ["a"]}
         async def main(wf, args):
-            r = await wf.agent("ORIGINAL-TASK @@NOSESSION@@", route="sonnet", schema=S, retries=1)
+            r = await wf.agent("ORIGINAL-TASK @@NOSESSION@@", route="opus", schema=S, retries=1)
             return r.key
         """)
         key = self.result(rid)
@@ -305,7 +305,7 @@ class TestParity(Base):
         _, rid = self.run_wf("""
         META = {"name": "loose", "description": "d"}
         async def main(wf, args):
-            rs = await wf.parallel([wf.agent("a", route="sonnet"), lambda: 7, lambda: wf.agent("b", route="sonnet")])
+            rs = await wf.parallel([wf.agent("a", route="opus"), lambda: 7, lambda: wf.agent("b", route="opus")])
             return [bool(rs[0]), rs[1], bool(rs[2])]
         """)
         self.assertEqual(self.result(rid), [True, 7, True])
@@ -315,8 +315,8 @@ class TestParity(Base):
         META = {"name": "ph", "description": "d"}
         async def main(wf, args):
             async def one(i):
-                a = await wf.agent(f"find {i}", route="sonnet", phase="Find", label=f"find-{i}")
-                return await wf.agent(f"verify {i}", route="sonnet", phase="Verify", label=f"verify-{i}")
+                a = await wf.agent(f"find {i}", route="opus", phase="Find", label=f"find-{i}")
+                return await wf.agent(f"verify {i}", route="opus", phase="Verify", label=f"verify-{i}")
             return await wf.pipeline([0, 1], lambda item, i: one(item))
         """)
         out = self.h.run("status", rid).stdout
@@ -330,7 +330,7 @@ class TestParity(Base):
         child = self.h.write_script("""
         META = {"name": "child", "description": "d"}
         async def main(wf, args):
-            r = await wf.agent("child " + args, route="sonnet")
+            r = await wf.agent("child " + args, route="opus")
             if args == "outer":
                 try:
                     await wf.workflow("child.py", "inner")
@@ -354,7 +354,7 @@ class TestParity(Base):
         _, rid = self.run_wf(f"""
         META = {{"name": "iso", "description": "d"}}
         async def main(wf, args):
-            r = await wf.agent("look", route="sonnet", dir={os.path.join(repo, "sub")!r}, isolation="worktree")
+            r = await wf.agent("look", route="opus", dir={os.path.join(repo, "sub")!r}, isolation="worktree")
             return {{"ok": r.ok, "worktree": r.worktree}}
         """)
         self.assertEqual(self.result(rid), {"ok": True, "worktree": None})

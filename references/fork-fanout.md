@@ -51,13 +51,13 @@ because they skip exploration. The saving applies to the shared prefix only.
 Each child's own output, its extra reads, and its prompt cost the same as
 before. Provider figures as of September 2026:
 
-- **Anthropic (claude_code routes `sonnet`, `opus`):** read 0.1× base input
+- **Anthropic (claude_code route `opus`):** read 0.1× base input
   (lower on some newer models), 5-minute write 1.25×, 1-hour write 2×. Every
   read refreshes the TTL. `claude -p` uses a 1h TTL on a subscription within
   plan usage and 5m on an API key; `CLAUDE_CODE_PROMPT_CACHE_TTL=1h` raises an
   API-key route to 1h. Cache reads still count toward plan usage, at the cached
   rate.
-- **OpenAI (codex routes `luna`, `terra`, `sol`, `astra`; `pi-sol`):** cached
+- **OpenAI (codex routes `luna`, `sol`, `astra`; `pi-sol`):** cached
   input 0.1×, minimum 1,024 tokens, and a prefix stays warm about 30 minutes,
   refreshed on each reuse. ChatGPT-plan Codex credits charge no write premium.
 - **Z.ai GLM (`glm`, `pi-glm`):** caching is implicit. The coding-plan cached
@@ -84,7 +84,7 @@ by default it keeps the parent's route, model, effort, `dir`, `posture` and
 3. **Same posture and context mode.** pi and prime-agent build their system
    prompt from the posture's tool list, and the `glm` and `deepseek` launchers
    put a posture guard into it, so a posture change misses the cache. Only the
-   Anthropic launcher (`sonnet`, `opus`) is posture-neutral. Never change
+   Anthropic launcher (`opus`) is posture-neutral. Never change
    posture on a fork.
 4. **Start children promptly and keep them busy.** Every child's first request
    reads the prefix and refreshes its TTL. With a route capped at
@@ -93,9 +93,9 @@ by default it keeps the parent's route, model, effort, `dir`, `posture` and
    raise the cap for this run with a `--routes` file (a path, not inline JSON)
    containing `{"glm": {"max_concurrency": 8}}`.
 5. **Keep the explorer on a fork-capable harness and pass
-   `require_native=True`.** Forks run on `glm`, `deepseek`, `sonnet`, `opus`
-   (claude_code), `luna`, `terra`, `sol`, `astra` (codex), and `pi-glm`,
-   `pi-muse`, `pi-sol` (pi). They do not run on `gemini`, `muse` or `kimi`. The
+   `require_native=True`.** Forks run on `glm`, `deepseek`, `opus`
+   (claude_code), `luna`, `sol`, `astra` (codex), and `pi-glm`,
+   `pi-muse`, `pi-sol` (pi). They do not run on `gemini` or `muse`. The
    cheap routes fall back to non-fork routes, so give the explorer
    `fallback=[]`. Otherwise one rate-limit can move the explorer to `muse`, and
    every "fork" silently degrades into a fresh agent that receives only the
@@ -150,7 +150,7 @@ width. This snippet uses the prompt and schema constants from
 ```python
 async def main(wf, args):
     async def shard(group, g):
-        ex = await wf.agent(EXPLORE.format(target=group), route="sonnet", dir=args["root"], fallback=[], label=f"explore-{g}")
+        ex = await wf.agent(EXPLORE.format(target=group), route="opus", dir=args["root"], fallback=[], label=f"explore-{g}")
         if not ex:
             return []
         reviews = await wf.parallel([
