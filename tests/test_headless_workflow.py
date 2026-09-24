@@ -255,12 +255,12 @@ class TestRoutingFallback(unittest.TestCase):
         script = self.h.write_script("""
         META = {"name": "explicit", "description": "explicit route"}
         async def main(wf, args):
-            r = await wf.agent("x @@REPLY:y@@", route={"harness": "kimi_code", "provider": "kimi", "model": "k3", "effort": "max"})
+            r = await wf.agent("x @@REPLY:y@@", route={"harness": "codex", "provider": "openai", "model": "gpt-6-luna", "effort": "xhigh"})
             return {"route": r.route}
         """)
         self.h.result(self.h.run_id_from(self.h.run("run", script)))
         c = self.h.calls()[0]
-        self.assertEqual((c["harness"], c["provider"], c["model"], c["effort"]), ("kimi_code", "kimi", "k3", "max"))
+        self.assertEqual((c["harness"], c["provider"], c["model"], c["effort"]), ("codex", "openai", "gpt-6-luna", "xhigh"))
 
     def test_no_fallback_yields_not_ok(self):
         script = self.h.write_script("""
@@ -472,13 +472,19 @@ class TestUnits(unittest.TestCase):
 
     def test_default_routes_cover_documented_names(self):
         routes = self.m.load_routes(None)
-        for name in ["glm", "gemini", "muse", "kimi", "opus", "sonnet", "luna", "sol"]:
+        for name in ["glm", "gemini", "muse", "deepseek", "opus", "luna", "sol", "astra"]:
             self.assertIn(name, routes)
             self.assertIn("harness", routes[name])
             self.assertIn("provider", routes[name])
             self.assertIn("model", routes[name])
         self.assertFalse(self.m.route_supports_fork(routes["gemini"]))
         self.assertTrue(self.m.route_supports_fork(routes["glm"]))
+        for name in ["kimi", "sonnet", "terra"]:
+            self.assertNotIn(name, routes)
+        self.assertEqual((routes["luna"]["model"], routes["luna"]["effort"]), ("gpt-6-luna", "max"))
+        self.assertEqual(routes["sol"]["model"], "gpt-6-sol")
+        self.assertEqual(routes["pi-sol"]["model"], "gpt-6-sol")
+        self.assertEqual((routes["opus"]["model"], routes["opus"]["effort"]), ("opus", "medium"))
 
 
 if __name__ == "__main__":

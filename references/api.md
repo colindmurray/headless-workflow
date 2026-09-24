@@ -105,7 +105,7 @@ Each entry:
         "quota": "zai", "fallback": ["muse", "gemini"], "timeout": 1800}
 ```
 
-- `quota`: `check-ai-quota --provider` id (`zai`, `gemini`, `meta`, `kimi`,
+- `quota`: `check-ai-quota --provider` id (`zai`, `gemini`, `meta`,
   `claude`, `openai`, `deepseek`); `null` disables preflight for that route.
   Preflight runs once per (quota id, account, model) per run, off the event
   loop; exit 20 (exhausted), 22 (critically limited) or 23 blocks the route,
