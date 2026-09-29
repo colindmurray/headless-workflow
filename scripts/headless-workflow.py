@@ -55,7 +55,7 @@ DEFAULT_ROUTES = {
     "deepseek": {"harness": "claude_code", "provider": "deepseek",  "model": "deepseek-v4-flash",          "effort": "high", "posture": "review", "max_concurrency": 4, "quota": "deepseek", "fallback": ["glm", "muse"],    "timeout": 1800},
     "opus":     {"harness": "claude_code", "provider": "anthropic", "model": "opus",                       "effort": "medium", "posture": "review", "max_concurrency": 3, "quota": "claude",   "fallback": [],                 "timeout": 2400},
     "luna":     {"harness": "codex",       "provider": "openai",    "model": "gpt-6-luna",                 "effort": "max",  "posture": "review", "max_concurrency": 3, "quota": "openai",   "fallback": [],                 "timeout": 1800},
-    "sol":      {"harness": "codex",       "provider": "openai",    "model": "gpt-6-sol",                  "effort": "high", "posture": "review", "max_concurrency": 2, "quota": "openai",   "fallback": [],                 "timeout": 2400},
+    "sol":      {"harness": "codex",       "provider": "openai",    "model": "gpt-6.1-sol",                "effort": "high", "posture": "review", "max_concurrency": 2, "quota": "openai",   "fallback": [],                 "timeout": 2400},
     "astra":    {"harness": "codex", "provider": "openai", "model": "gpt-6-astra", "effort": "medium", "posture": "review", "max_concurrency": 1, "quota": "openai", "fallback": [], "format": "json", "timeout": 2400},
     # pi routes: the same providers through a minimal harness. Pi has no MCP,
     # no subagents and no permission prompts, so its system prompt is ~1.3k
@@ -69,7 +69,7 @@ DEFAULT_ROUTES = {
     # campaign's stream format mid-flight is not worth the churn.
     "pi-glm":   {"harness": "pi", "provider": "zai",          "model": "glm-5.3-flash",              "effort": "high", "posture": "review", "context": "lean", "max_concurrency": 6, "quota": "zai",    "fallback": ["glm", "pi-muse"],  "timeout": 1800},
     "pi-muse":  {"harness": "pi", "provider": "meta",         "model": "muse-spark-1.3-contributor", "effort": "high", "posture": "review", "context": "lean", "max_concurrency": 6, "quota": "meta",   "fallback": ["muse", "pi-glm"],  "timeout": 1800},
-    "pi-sol":   {"harness": "pi", "provider": "openai-codex", "model": "gpt-6-sol",                  "effort": "high", "posture": "review", "context": "lean", "max_concurrency": 2, "quota": "openai", "fallback": ["sol"],             "timeout": 2400},
+    "pi-sol":   {"harness": "pi", "provider": "openai-codex", "model": "gpt-6.1-sol",                "effort": "high", "posture": "review", "context": "lean", "max_concurrency": 2, "quota": "openai", "fallback": ["sol"],             "timeout": 2400},
 }
 
 FORK_HARNESSES = {"claude_code", "codex", "opencode", "pi", "prime-agent"}
