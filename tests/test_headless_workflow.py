@@ -482,8 +482,8 @@ class TestUnits(unittest.TestCase):
         for name in ["kimi", "sonnet", "terra"]:
             self.assertNotIn(name, routes)
         self.assertEqual((routes["luna"]["model"], routes["luna"]["effort"]), ("gpt-6-luna", "max"))
-        self.assertEqual(routes["sol"]["model"], "gpt-6-sol")
-        self.assertEqual(routes["pi-sol"]["model"], "gpt-6-sol")
+        self.assertEqual(routes["sol"]["model"], "gpt-6.1-sol")
+        self.assertEqual(routes["pi-sol"]["model"], "gpt-6.1-sol")
         self.assertEqual((routes["opus"]["model"], routes["opus"]["effort"]), ("opus", "medium"))
 
 
