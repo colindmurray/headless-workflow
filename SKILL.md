@@ -100,11 +100,9 @@ do not relaunch work just because a tool yielded. From Claude Code, run it with
 
 ## Routes
 
-`python3 "$HW" routes` prints the effective table. Built-ins: `glm`,
-`gemini`, `muse`, `deepseek` (cheap workers), `opus`, `luna`, `sol`
-(judgment), `astra` (cautious frontier escalation), and
-`pi-glm`, `pi-muse`, `pi-sol` (the
-same providers through the minimal `pi` harness). Each carries harness/provider/model,
+`python3 "$HW" routes` prints the effective table. Built-ins include `glm`,
+`gemini`, `muse`, `deepseek`, `opus`, `luna`, `sol`, `astra`, `pi-glm`,
+`pi-muse`, and `pi-sol`. Each carries harness/provider/model,
 effort, posture, `max_concurrency`, a quota id for the `check-ai-quota`
 preflight (exit 20, 22 or 23 skips the route), and a `fallback` list tried in order
 when a dispatch fails. Add `"format": "json"` to any route when you need to
@@ -112,17 +110,21 @@ account for its token spend afterwards: without it a codex route runs in its
 text default, whose stream carries no structured usage. Override or add routes in
 `~/.config/headless-workflow/routes.json` or `--routes file.json` (per-name
 merge), or pass a dict: `route={"harness": "codex", "provider": "openai",
-"model": "gpt-6-luna", "effort": "xhigh"}`. `gemini` defaults to posture `code` because `agy` in review
-posture is denied file reads.
+"model": "gpt-6-luna", "effort": "low"}`. `gemini` defaults to posture `code`
+because `agy` in review posture is denied file reads.
 
-`astra` selects `gpt-6-astra` at medium, concurrency 1, JSON output for token
-accounting, and no fallback. Agents may select it without Colin's permission
-when `route-ai-work` justifies its premium; do not use it for speculative bulk
-fan-out. It spends the chosen account's shared OpenAI allowance at 5x Sol's
-per-token price. Codex supports low/medium/high/xhigh/max plus `ultra`
-automatic delegation; no none/minimal. The account-selection policy still
-applies: `route="astra"` retains the active account, while
-`openai_account="aether"` or the managed `astra-aether` route selects Aether.
+For new OpenAI work, use `route-ai-work` to select GPT-6.2 Sol for everyday
+work, GPT-6.2 Astra for hard work, or GPT-6 Luna at low or medium for easy,
+bounded work. Verify the exact model and effort on the selected account and
+harness before using an explicit route. Use an empty fallback list when the
+exact model is required.
+
+`sol` and `pi-sol` are compatibility presets for `gpt-6.1-sol`. The
+`astra` compatibility preset selects `gpt-6-astra` at medium, concurrency 1,
+JSON output, and no fallback. `luna` selects `gpt-6-luna` at max. Codex routes
+spend the selected account's shared allowance. `route="astra"` retains the active
+account. `openai_account="aether"` or the managed `astra-aether` route selects
+Aether explicitly.
 
 Use a lean `pi-*` route when its limited toolset meets the task. Steps needing
 MCP, delegation, or discovered skills may need another harness. Read
